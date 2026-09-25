@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Sync Custom Endpoints",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"clm_sync.cli",
+				"--config",
+				"${workspaceFolder}/chatLanguageModels.json",
+				"--all",
+				"--no-delete"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	]
+}

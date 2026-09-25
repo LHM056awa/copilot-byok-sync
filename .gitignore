@@ -1,0 +1,22 @@
+# VS Code local files (tasks.json is shared)
+.vscode/*
+!.vscode/tasks.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build and packaging output
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local secrets and configuration
+.env
+.env.*
+chatLanguageModels.json
