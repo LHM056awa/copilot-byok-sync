@@ -117,7 +117,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ## 工作区推荐配置
 
-在 `.vscode/tasks.json` 中添加以下任务，让它变成快捷键：
+在 `.vscode/tasks.json` 中添加以下任务，让它变成快捷键。该任务同步的是**全局配置**（用户数据目录下 VS Code 实际生效的文件，`%APPDATA%\Code\User\chatLanguageModels.json`）：
 
 ```json
 {
@@ -131,9 +131,8 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
         "-m",
         "clm_sync.cli",
         "--config",
-        "${workspaceFolder}/chatLanguageModels.json",
-        "--all",
-        "--no-delete"
+        "${env:APPDATA}/Code/User/chatLanguageModels.json",
+        "--all"
       ],
       "group": {
         "kind": "build",
@@ -143,6 +142,8 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
   ]
 }
 ```
+
+> `${env:APPDATA}` 是 VS Code 任务的环境变量替换（Windows 下展开为 `C:\Users\<你>\AppData\Roaming`）。
 
 ## 开发
 
@@ -174,3 +175,4 @@ copilot-byok-sync/
 ### 后续计划
 
 - 将端点请求优化为多线程并发，减少多个端点依次等待造成的总耗时。
+- 支持参数简写。

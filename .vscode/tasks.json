@@ -9,9 +9,8 @@
 				"-m",
 				"clm_sync.cli",
 				"--config",
-				"${workspaceFolder}/chatLanguageModels.json",
-				"--all",
-				"--no-delete"
+				"${env:APPDATA}/Code/User/chatLanguageModels.json",
+				"--all"
 			],
 			"group": {
 				"kind": "build",
