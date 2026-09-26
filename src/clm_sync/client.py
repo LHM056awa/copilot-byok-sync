@@ -152,7 +152,7 @@ def default_transport(
     """
     request = urllib.request.Request(url, method="GET")
     request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "clm-sync/0.1.0")
+    request.add_header("User-Agent", "clm-sync/0.2.0")
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")
     try:
