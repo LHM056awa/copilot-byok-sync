@@ -6,25 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-
 CUSTOM_ENDPOINT_VENDOR = "customendpoint"
-
-
-@dataclass(frozen=True)
-class EndpointCall:
-    """A single request this tool intends to make.
-
-    This deliberately carries **no** credential information. API keys stay in
-    the VS Code Secret Storage reference form inside chatLanguageModels.json and
-    are never read, resolved, or logged by this tool.
-    """
-
-    url: str
-    provider_name: str
-    base_url: str
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"EndpointCall(provider={self.provider_name!r}, url={self.url!r})"
 
 
 @dataclass
@@ -67,6 +49,17 @@ class ModelSyncError(Exception):
 def is_custom_endpoint(provider: Any) -> bool:
     """Return True when a provider entry is a user-defined OpenAI-compatible endpoint."""
     return isinstance(provider, dict) and provider.get("vendor") == CUSTOM_ENDPOINT_VENDOR
+
+
+def is_secret_placeholder(value: Any) -> bool:
+    """Return True when *value* is a VS Code template reference such as
+    ``${input:chat.lm.secret.<id>}``.
+
+    Such a value is a reference, not a usable key.  When it cannot be resolved
+    to a real key it must never be sent verbatim as an ``Authorization`` token;
+    callers should treat it as "no key" instead.
+    """
+    return isinstance(value, str) and value.startswith("${input:")
 
 
 def normalize_id(raw: Any) -> str | None:

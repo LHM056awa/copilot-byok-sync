@@ -2,6 +2,8 @@
 
 同步 VS Code（Copilot 聊天 BYOK）维护的 `chatLanguageModels.json` 文件中 `vendor=customendpoint` 条目的模型列表，从 OpenAI 兼容的 `/v1/models` 端点拉取最新模型信息。
 
+需要认证的端点会被自动解析 VS Code 加密存储（Secret Storage）里的 API key，并以 `Authorization: Bearer` 头发送。
+
 ## 安装与使用
 
 ### 1. 安装依赖
@@ -21,7 +23,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --all
 
 > 也可用 `python -m clm_sync`（等价，包级入口同样会解析命令行参数），或直接使用安装后的 `clm-sync` 命令。
 
-#### 同步单个 customendpoint（可重复）
+#### 同步指定 customendpoint
 
 ```bash
 python -m clm_sync.cli --config chatLanguageModels.json --provider A
@@ -30,29 +32,52 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ### 3. 命令行参数详解
 
-| 参数                  | 含义                                                | 默认值 | 示例                                 |
-| --------------------- | --------------------------------------------------- | ------ | ------------------------------------ |
-| `--config`          | 配置文件路径（必须）                                | 无     | `--config chatLanguageModels.json` |
-| `--all`             | 同步**所有** customendpoint（默认）           | 无     | `--all`                            |
-| `--provider NAME`   | 同步**指定单个** customendpoint（可多次指定） | 无     | `--provider A`                     |
-| `--dry-run`         | 只显示变更，不实际写入文件                          | 无     | `--dry-run`                        |
-| `--no-delete`       | 只添加远端发现的新模型，不删除或覆盖本地已有模型    | 无     | `--no-delete`                      |
-| `--timeout SECONDS` | 请求超时时间（秒）                                  | 15     | `--timeout 30`                     |
-| `--version`         | 显示版本信息                                        | 无     | `--version`                        |
+| 参数 | 含义 |
+| - | - |
+| `--config` | 配置文件路径（必须） |
+| `--all` | 同步**所有** customendpoint（与 `--provider` 二选一，必须指定其一） |
+| `--provider NAME` | 同步**指定单个** customendpoint（可多次指定） |
+| `--dry-run` | 只显示变更，不实际写入文件 |
+| `--no-delete` | 只添加远端发现的新模型，不删除或覆盖本地已有模型 |
+| `--sort` | 顺带把每个端点的模型列表按 id 字典序升序（大小写敏感）重排；默认保留原顺序 |
+| `--timeout SECONDS` | 请求超时时间（秒），默认 15 |
+| `--version` | 显示版本信息 |
 
 ## URL 规范
 
-你提供给工具的 `url` 可以是以下任意格式（工具会自动规范化）：
+提供给工具的 `url` 可以是以下任意格式（工具会自动规范化）：
 
 - `https://api.deepseek.com`
 - `https://api.deepseek.com/v1`
-- `https://api.deepseek.com/v1/chat/completions`
+- `https://api.deepseek.com/v1/chat/completions`（含尾斜杠、任意大小写）
+- `https://api.deepseek.com/v1/responses`（Responses-API 网关）
+- 以上任意一种带 query string（如 `?limit=100`，会被剥离）
 
 工具会自动把以上 URL 转换为 `https://api.deepseek.com/v1/models` 来请求模型列表。
 
 `--config` 必须指向实际被 VS Code 使用的配置文件。如果你同时维护多个配置副本，请确认编辑的文件与同步命令使用的是同一个路径。
 
-当前工具不会解析 VS Code Secret Storage 中的 `${input:...}` 引用，也不会自动读取或发送 API key。因此，只有无需认证即可访问 `/v1/models` 的端点可以直接同步；需要认证的端点会报告请求失败。
+## API key 自动解析
+
+当 provider 的 `apiKey` 字段是形如 `${input:chat.lm.secret.<id>}` 的 VS Code Secret Storage 占位符时，工具会自动解析出真实 key 并随请求发送（`Authorization: Bearer <key>`），整个过程无需手动管理密钥。
+
+**解析链路：**
+
+1. 占位符中的 `<id>` 映射到 `%APPDATA%\Code\User\globalStorage\state.vscdb` 的 `secret://chat.lm.secret.<id>` 条目。
+2. 该条目的密文是 `v10` 格式（`v10` + 12 字节 nonce + AES-256-GCM 密文 + 16 字节 tag）。
+3. 32 字节 AES 主密钥存于 `%APPDATA%\Code\Local State` 的 `os_crypt.encrypted_key`，由 Windows DPAPI 保护，用 `CryptUnprotectData` 解包。
+4. 解密后的 key 只存在于进程内存，**不会打印、记录或写入任何文件**。
+
+**行为矩阵：**
+
+| `apiKey` 值形态 | 请求是否带`Authorization` 头 | 说明 |
+| - | - | - |
+| 字面 key（如`sk-xxx`） | 是 | 直接作为 Bearer 发送 |
+| `${input:chat.lm.secret.<id>}` 占位符 | 是（解析后） | 自动从 VS Code 加密存储解密 |
+| 占位符但解析失败 | 否 | 降级为无 key 请求，返回 401 不中断 |
+|  缺失 | 否 | 请求不带头，端点自行决定 |
+
+若 `cryptography` 包未安装，占位符解析会静默降级（返回 401），不影响其他 provider 的同步。
 
 ## 新增模型的字段
 
@@ -79,6 +104,10 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 - 每个成功响应都包含至少一个有效模型 ID。
 
 如果任一端点返回 `401`、请求超时、网络错误或响应格式无效，当前 provider 会跳过删除，并保留本地已有模型。使用 `--no-delete` 时，无论远端结果如何都只新增模型，不删除或覆盖本地已有模型。
+
+**顺序语义。** 默认**保留你手排的模型顺序**，新模型**追加到列表末尾**；没有实质变更的同步不会重写文件。加 `--sort` 参数可顺带把每个端点的模型列表按 id 字典序升序（大小写敏感，`Z` 排在 `a` 前）重排——首次排序会重写一次，此后顺序已稳定，再跑 `--sort` 即 no-op。
+
+**本地重复 id。** 同一个 id 在本地出现多条时，`--no-delete` 下**全部保留**（不静默去重丢失数据）；允许删除且远端已不下发该 id 时，所有重复条目会**一并删除**（只报告一次）。
 
 ## 安全性说明
 
@@ -132,16 +161,16 @@ copilot-byok-sync/
 │   ├── __init__.py
 │   ├── __main__.py
 │   ├── cli.py          # 命令行入口
-│   ├── client.py       # HTTP 请求
+│   ├── client.py       # HTTP 请求（含 Authorization 头）
 │   ├── config.py       # 读写 chatLanguageModels.json
 │   ├── models.py       # 数据结构
+│   ├── secrets.py      # VS Code 加密存储占位符解析（DPAPI + AES-GCM）
 │   └── sync.py         # 核心同步逻辑
 ├── tests/
 │   └── test_sync.py
 └── README.md
 ```
 
-## 后续计划
+### 后续计划
 
 - 将端点请求优化为多线程并发，减少多个端点依次等待造成的总耗时。
-- 支持需要 API key 才能获取 `/v1/models` 的端点。

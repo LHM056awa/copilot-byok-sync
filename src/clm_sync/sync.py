@@ -15,6 +15,7 @@ Guarantees implemented here:
 from __future__ import annotations
 
 import copy
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -25,6 +26,7 @@ from .models import (
     base_display_name,
     endpoint_base_urls,
     is_custom_endpoint,
+    is_secret_placeholder,
     normalize_id,
 )
 
@@ -122,25 +124,13 @@ def plan_calls(providers: Iterable[Dict[str, Any]]) -> List[tuple]:
     return pairs
 
 
-def _index_existing(models: Any) -> Dict[str, Dict[str, Any]]:
-    """Map usable model id -> its existing object, one entry per unique id."""
-    index: Dict[str, Dict[str, Any]] = {}
-    if isinstance(models, list):
-        for entry in models:
-            if not isinstance(entry, dict):
-                continue
-            model_id = normalize_id(entry.get("id"))
-            if model_id is not None and model_id not in index:
-                index[model_id] = entry
-    return index
-
-
 def merge_provider_models(
     provider_name: str,
     existing_models: Any,
     results: Sequence[FetchResult],
     *,
     allow_delete: bool,
+    sort_models: bool = False,
 ) -> tuple[List[Dict[str, Any]], ProviderSyncResult]:
     """Merge fetched ids into existing models for one provider.
 
@@ -149,10 +139,17 @@ def merge_provider_models(
     without a usable string id (or that are not objects at all) have no
     meaning in the config file, so they are discarded from the model list in
     every mode and reported via `ProviderSyncResult.discarded_invalid`.
+
+    Order semantics: existing entries keep their original relative order and
+    duplicates of an id are all preserved; newly advertised models are
+    appended at the end in the order the endpoints advertised them.  A run
+    that changes nothing keeps the list byte-identical, so the file is not
+    rewritten on no-op runs.  When *sort_models* is set, the merged list is
+    instead written in ascending model-id order (case-sensitive
+    lexicographic order).
     """
     result = ProviderSyncResult(name=provider_name)
 
-    existing_index = _index_existing(existing_models)
     discarded: List[Any] = []
     if isinstance(existing_models, list):
         for entry in existing_models:
@@ -181,18 +178,27 @@ def merge_provider_models(
     all_succeeded = bool(results) and all(r.success for r in results)
     can_delete = allow_delete and all_succeeded
 
-    merged: Dict[str, Dict[str, Any]] = {}
-
     # Keep existing models (with all their metadata) when still advertised, or
-    # when deletion is not safe.
-    for model_id, original in existing_index.items():
-        if model_id in all_remote_ids or not can_delete:
-            merged[model_id] = copy.deepcopy(original)
+    # when deletion is not safe.  Duplicates of an id are all kept or all
+    # dropped together, so no locally authored entry is lost silently.
+    ordered: List[Dict[str, Any]] = []
+    surviving_ids: set = set()
+    if isinstance(existing_models, list):
+        for entry in existing_models:
+            if not isinstance(entry, dict):
+                continue
+            model_id = normalize_id(entry.get("id"))
+            if model_id is None:
+                continue
+            if model_id in all_remote_ids or not can_delete:
+                ordered.append(copy.deepcopy(entry))
+                surviving_ids.add(model_id)
 
-    # Add newly advertised models, preserving previous-url preference.
+    # Add newly advertised models in endpoint-advertised order, preserving
+    # previous-url preference.
     for base_url, ids in remote_by_url.items():
         for model_id in ids:
-            if model_id in merged:
+            if model_id in surviving_ids:
                 continue
             remote_model = remote_metadata.get(model_id, {})
             model = {
@@ -205,31 +211,56 @@ def merge_provider_models(
             model.setdefault("url", base_url)
             for key, value in DEFAULT_NEW_MODEL_FIELDS.items():
                 model.setdefault(key, copy.deepcopy(value))
-            merged[model_id] = model
+            ordered.append(model)
+            surviving_ids.add(model_id)
+
+    existing_ids = set()
+    if isinstance(existing_models, list):
+        for entry in existing_models:
+            if isinstance(entry, dict):
+                entry_id = normalize_id(entry.get("id"))
+                if entry_id is not None:
+                    existing_ids.add(entry_id)
 
     if can_delete:
-        result.removed = sorted(set(existing_index) - set(merged), key=str.lower)
-    result.added = sorted(set(merged) - set(existing_index), key=str.lower)
-    result.kept = len(set(existing_index) & set(merged))
+        result.removed = sorted(existing_ids - surviving_ids, key=str.lower)
+    result.added = sorted(surviving_ids - existing_ids, key=str.lower)
+    result.kept = len(existing_ids & surviving_ids)
     result.skipped_deletion = bool(results) and not can_delete
 
-    ordered = [merged[k] for k in sorted(merged, key=str.lower)]
+    # Optional canonical order: ascending model-id order in strict
+    # lexicographic (dictionary) order, i.e. case-sensitive codepoint
+    # comparison ("Zeta" sorts before "alpha").  A case-insensitive key
+    # would create ties that a stable sort resolves by insertion order,
+    # making the result non-deterministic; case-sensitive is both the
+    # literal "字典序" and fully deterministic.
+    if sort_models:
+        ordered.sort(key=lambda entry: str(entry["id"]))
     return ordered, result
 
 
 def apply_provider_sync(
-    provider: Dict[str, Any], results: Sequence[FetchResult], *, allow_delete: bool
+    provider: Dict[str, Any],
+    results: Sequence[FetchResult],
+    *,
+    allow_delete: bool,
+    sort_models: bool = False,
 ) -> ProviderSyncResult:
     """Merge models and prune orphaned `settings` entries in one provider (in place).
 
     Only model quotations that are actually removed get their settings entry
     deleted, which is the "sync delete must also drop reasoningEffort" rule.
+
+    Providers that declare no requestable endpoint (no `models`, or a `models`
+    list with no urls) are not forced to acquire a `models: []` field: a
+    provider with no requests returns an empty merged list, and writing that
+    would fabricate a key the user never had.
     """
     name = provider.get("name") or "<unnamed>"
     fetched = [r for r in results if r.provider_name == name]
 
     new_models, result = merge_provider_models(
-        name, provider.get("models"), fetched, allow_delete=allow_delete
+        name, provider.get("models"), fetched, allow_delete=allow_delete, sort_models=sort_models
     )
 
     for res in fetched:
@@ -238,7 +269,8 @@ def apply_provider_sync(
             result.errors.append(f"{res.base_url}: {message}")
 
     changed = False
-    if provider.get("models") != new_models:
+    has_models_key = "models" in provider
+    if (has_models_key or new_models) and provider.get("models") != new_models:
         provider["models"] = new_models
         changed = True
 
@@ -285,27 +317,102 @@ def _select_positions(
     return [i for i, p in enumerate(config) if is_custom_endpoint(p)]
 
 
+def _resolve_provider_key(
+    provider: Dict[str, Any], key_resolver
+) -> Optional[str]:
+    """Return the provider's effective API key for outbound requests.
+
+    The provider's immutable ``apiKey`` field is read (never written).  A
+    plain literal value is used as-is.  A VS Code secret placeholder
+    (``${input:...}``) is handed to *key_resolver*; when it cannot be
+    resolved, the request is made **without** a key (a 401 will surface in
+    the run report) rather than sending the placeholder text itself.  This
+    keeps the failure mode safe: the placeholder is a reference, not a
+    credential.
+    """
+    raw = provider.get("apiKey")
+    if not isinstance(raw, str) or not raw:
+        return None
+    if key_resolver is None:
+        if is_secret_placeholder(raw):
+            # No resolver available: an unresolvable reference is not a key.
+            return None
+        return raw
+    resolved = key_resolver(raw)
+    if resolved is not None:
+        return resolved
+    # Resolution failed.  A literal value can still be tried as-is (it may be
+    # a plain key the caller just didn't resolve); a placeholder must not be
+    # sent verbatim as an Authorization token.
+    return None if is_secret_placeholder(raw) else raw
+
+
+def _fetcher_takes_key(fetcher) -> bool:
+    """Return True when *fetcher* accepts an ``api_key`` argument.
+
+    Positional-arity probing keeps the legacy two-argument
+    ``fetcher(name, base_url)`` contract working unchanged, so existing
+    callers (and the test suite) need no migration.  A fetcher declared
+    with ``*args`` (VAR_POSITIONAL) can also take a third positional
+    argument, so it is treated as key-accepting; without that check the key
+    would be silently dropped and the request sent unauthenticated.
+    """
+    sig = inspect.signature(fetcher)
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()):
+        return True
+    positional = [
+        p
+        for p in sig.parameters.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    return len(positional) >= 3
+
+
 def sync_config(
     config: List[Dict[str, Any]],
     fetcher,
     provider_names: Optional[Sequence[str]] = None,
     *,
     allow_delete: bool = True,
+    key_resolver=None,
+    sort_models: bool = False,
 ) -> SyncOutcome:
-    """Run the full sync pipeline over `config` without touching disk."""
+    """Run the full sync pipeline over `config` without touching disk.
+
+    *fetcher* is called as ``fetcher(name, base_url, api_key)`` when it accepts
+    three positional arguments (as the CLI does), or as the legacy
+    ``fetcher(name, base_url)`` otherwise, so existing two-argument fetchers keep
+    working.  *key_resolver* (optional) maps a provider's raw ``apiKey`` value to
+    the actual key sent in the request, enabling VS Code secret placeholders to
+    be resolved on the caller side without `sync` ever touching the encrypted
+    store.  *sort_models* (default False) rewrites each provider's model list
+    in ascending model-id order; when False the original order is preserved and
+    new models are appended.
+    """
     working = copy.deepcopy(config)
     providers = [working[i] for i in _select_positions(config, provider_names)]
 
     calls = plan_calls(providers)
+    pass_key = _fetcher_takes_key(fetcher)
 
     # Results are keyed by the provider object itself so providers that share
     # a name can never mix up their fetch results.
     results_by_provider: Dict[int, List[FetchResult]] = {}
     for provider, base_url in calls:
         name = provider.get("name") or "<unnamed>"
-        results_by_provider.setdefault(id(provider), []).append(
-            fetcher(name, base_url)
-        )
+        if pass_key:
+            api_key = _resolve_provider_key(provider, key_resolver)
+            results_by_provider.setdefault(id(provider), []).append(
+                fetcher(name, base_url, api_key)
+            )
+        else:
+            results_by_provider.setdefault(id(provider), []).append(
+                fetcher(name, base_url)
+            )
 
     provider_results: List[ProviderSyncResult] = []
     for provider in providers:
@@ -314,6 +421,7 @@ def sync_config(
                 provider,
                 results_by_provider.get(id(provider), []),
                 allow_delete=allow_delete,
+                sort_models=sort_models,
             )
         )
 

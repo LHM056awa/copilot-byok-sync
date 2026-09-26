@@ -22,13 +22,17 @@ def _ok(url: str, timeout=None) -> str:
     raise AssertionError(f"unexpected real HTTP call to {url}")
 
 
-def fake_transport(route: dict[str, object]):
+def fake_transport(route: dict[str, object], api_key_sink: list = None):
     """Build a transport keyed by requested url.
 
     route values are either a body string or an Exception to raise.
+    When *api_key_sink* is a list, the api_key passed per call is appended
+    to it so tests can assert on it without any key material being printed.
     """
 
-    def _call(url: str, timeout=None) -> str:
+    def _call(url: str, timeout=None, api_key=None) -> str:
+        if api_key_sink is not None:
+            api_key_sink.append(api_key)
         entry = route.get(url)
         if entry is None:
             raise TransportError(f"HTTP 404 (no fixture for {url})")
@@ -95,6 +99,34 @@ class ResolveUrlTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_models_url("   ")
 
+    def test_trailing_slash_on_chat_completions(self):
+        self.assertEqual(
+            "https://api.example.com/v1/models",
+            resolve_models_url("https://api.example.com/v1/chat/completions/"),
+        )
+
+    def test_case_insensitive_chat_completions(self):
+        self.assertEqual(
+            "https://api.example.com/v1/models",
+            resolve_models_url("https://api.example.com/V1/Chat/Completions/"),
+        )
+
+    def test_responses_subpath(self):
+        self.assertEqual(
+            "https://api.example.com/v1/models",
+            resolve_models_url("https://api.example.com/v1/responses"),
+        )
+
+    def test_query_string_is_stripped(self):
+        self.assertEqual(
+            "https://api.example.com/v1/models",
+            resolve_models_url("https://api.example.com/v1/models?limit=100"),
+        )
+        self.assertEqual(
+            "https://api.example.com/v1/models",
+            resolve_models_url("https://api.example.com/v1/chat/completions?foo=1"),
+        )
+
 
 class ParsePayloadTest(unittest.TestCase):
     def test_openai_shape(self):
@@ -137,6 +169,21 @@ class ParsePayloadTest(unittest.TestCase):
     def test_empty_raises(self):
         with self.assertRaises(TransportError):
             parse_models_payload('{"data": []}')
+
+    def test_single_object_data_is_wrapped(self):
+        """A single model object (not a list) is accepted and treated as one entry."""
+        payload = json.dumps({"data": {"id": "real-model", "object": "model", "name": "Real"}})
+        self.assertEqual(["real-model"], parse_models_payload(payload))
+
+    def test_string_data_is_rejected(self):
+        """A bare string must NOT be iterated character-by-character into ids."""
+        with self.assertRaises(TransportError):
+            parse_models_payload('{"data": "gpt-4"}')
+
+    def test_scalar_data_is_rejected(self):
+        """A non-container scalar 'data' is a malformed payload, not an iterable of ids."""
+        with self.assertRaises(TransportError):
+            parse_models_payload('{"data": 12}')
 
 
 class DisplayNameTest(unittest.TestCase):
@@ -201,7 +248,8 @@ class SyncTest(unittest.TestCase):
         outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
 
         models = outcome.config[0]["models"]
-        self.assertEqual(["new-model", "old"], [m["id"] for m in models])
+        # Default: existing entries keep their position; new models are appended.
+        self.assertEqual(["old", "new-model"], [m["id"] for m in models])
         new_model = next(m for m in models if m["id"] == "new-model")
         self.assertEqual(
             {
@@ -463,24 +511,28 @@ class SyncTest(unittest.TestCase):
             sync_config(cfg, lambda n, u: _fetch(n, u, {}), provider_names=["Dup"])
 
     def test_immutable_provider_fields_untouched(self):
-        cfg = [provider(api_key="${input:test-secret}")]
-        original = copy.deepcopy(cfg)
-        route = {"https://x.test/v1/models": body("brand-new")}
-        sync_config(
-            [
-                provider(
-                    models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
-                    api_key="${input:test-secret}",
-                )
-            ],
-            lambda n, u: _fetch(n, u, route),
-        )
-        updated = provider(
-            models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
-            api_key="${input:test-secret}",
-        )
-        for field in ("name", "vendor", "apiKey", "apiType"):
-            self.assertEqual(original[0][field], updated[field])
+        """sync_config must not rewrite name/vendor/apiKey/apiType on the
+        output provider.  (Regression: an earlier version of this test compared
+        the input against a freshly-built provider, so it passed vacuously and
+        protected nothing.)"""
+        api_key = "${input:test-secret}"
+        cfg = [
+            provider(
+                models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
+                api_key=api_key,
+            )
+        ]
+        route = {"https://x.test/v1/models": body("seed", "brand-new")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+
+        synced = outcome.config[0]
+        for field, expected in (
+            ("name", "TestProvider"),
+            ("vendor", "customendpoint"),
+            ("apiKey", api_key),
+            ("apiType", "chat-completions"),
+        ):
+            self.assertEqual(expected, synced[field])
 
     def test_same_url_different_providers_are_independent(self):
         """Shared base_url must not let one provider's result serve another."""
@@ -509,6 +561,271 @@ class SyncTest(unittest.TestCase):
         route = {"https://x.test/v1/models": body("a", "b")}
         outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
         self.assertFalse(outcome.changed)
+
+    def test_models_append_new_and_preserve_order_by_default(self):
+        """Default semantics: existing entries keep their hand-authored order
+        and new models are appended at the end (no re-sorting).  A run with
+        no substantive change is a no-op."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "zeta", "name": "Z", "url": "https://x.test"},
+                    {"id": "alpha", "name": "A", "url": "https://x.test"},
+                ]
+            )
+        ]
+        route = {"https://x.test/v1/models": body("zeta", "alpha")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["zeta", "alpha"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertFalse(outcome.changed, "no substantive change -> no rewrite")
+
+    def test_sort_models_orders_by_id_ascending(self):
+        """With sort_models=True the merged list is written in ascending model-id
+        order in strict lexicographic (dictionary) order: case-sensitive codepoint
+        comparison, so uppercase ids sort before lowercase ones ('Zeta' < 'alpha')."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "zeta", "name": "Z", "url": "https://x.test"},
+                    {"id": "alpha", "name": "A", "url": "https://x.test"},
+                    {"id": "Zeta", "name": "Zeta", "url": "https://x.test"},
+                ]
+            )
+        ]
+        route = {"https://x.test/v1/models": body("alpha", "zeta", "Zeta")}
+        outcome = sync_config(
+            cfg, lambda n, u: _fetch(n, u, route), sort_models=True
+        )
+        # Case-sensitive lexicographic: 'Z' (0x5A) < 'a' (0x61).
+        self.assertEqual(
+            ["Zeta", "alpha", "zeta"], [m["id"] for m in outcome.config[0]["models"]]
+        )
+        self.assertTrue(outcome.changed, "first sorted sync of an unsorted list rewrites")
+
+        # Second run over the already-sorted list is a no-op.
+        outcome2 = sync_config(
+            outcome.config, lambda n, u: _fetch(n, u, route), sort_models=True
+        )
+        self.assertFalse(outcome2.changed)
+
+    def test_sort_models_orders_new_models_into_place(self):
+        cfg = [
+            provider(models=[{"id": "Zeta", "name": "Z", "url": "https://x.test"}])
+        ]
+        route = {"https://x.test/v1/models": body("Zeta", "alpha")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route), sort_models=True)
+        ids = [m["id"] for m in outcome.config[0]["models"]]
+        self.assertEqual(["Zeta", "alpha"], ids)
+        self.assertEqual(["alpha"], outcome.providers[0].added)
+
+    def test_duplicate_local_ids_all_preserved_no_delete(self):
+        """--no-delete must not silently drop locally-duplicated ids; all copies
+        are kept (the docs promise 'never remove existing models')."""
+        existing = [
+            {"id": "dup", "name": "First", "url": "https://x.test", "keep": 1},
+            {"id": "dup", "name": "Second", "url": "https://x.test", "keep": 2},
+            {"id": "ok", "name": "Ok", "url": "https://x.test"},
+        ]
+        cfg = [provider(models=copy.deepcopy(existing))]
+        route = {"https://x.test/v1/models": body("dup", "ok")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route), allow_delete=False)
+        ids = [m["id"] for m in outcome.config[0]["models"]]
+        self.assertEqual(["dup", "dup", "ok"], ids)
+        keeps = [m.get("keep") for m in outcome.config[0]["models"]]
+        self.assertEqual([1, 2, None], keeps)
+
+    def test_duplicate_local_ids_all_removed_when_stale(self):
+        """When deletion is allowed and the id is no longer advertised, every
+        duplicate copy is dropped together (reported once)."""
+        existing = [
+            {"id": "dup", "name": "First", "url": "https://x.test"},
+            {"id": "dup", "name": "Second", "url": "https://x.test"},
+            {"id": "ok", "name": "Ok", "url": "https://x.test"},
+        ]
+        cfg = [provider(models=copy.deepcopy(existing))]
+        route = {"https://x.test/v1/models": body("ok")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route), allow_delete=True)
+        ids = [m["id"] for m in outcome.config[0]["models"]]
+        self.assertEqual(["ok"], ids)
+        self.assertIn("dup", outcome.providers[0].removed)
+
+    def test_provider_without_models_key_is_not_given_empty_list(self):
+        """A customendpoint that declares no requestable endpoint must not be
+        forced to acquire a `models: []` field - it has no urls, so no request
+        is made and the file must stay unchanged."""
+        empty = {"name": "Empty", "vendor": "customendpoint", "apiType": "chat-completions"}
+        outcome = sync_config([empty], lambda n, u: FetchResult(u, n, True, ["x"]))
+        self.assertFalse(outcome.changed)
+        self.assertNotIn("models", outcome.config[0])
+
+    def test_three_arg_fetcher_receives_resolved_key(self):
+        """A fetcher accepting three positional args must be called with the
+        key_resolver's output, so the real key reaches the transport without
+        ever being printed here."""
+        cfg = [
+            provider(
+                name="P",
+                models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
+                api_key="${input:chat.lm.secret.-x}",
+            )
+        ]
+        seen_keys: list = []
+
+        def fetcher(name, base_url, api_key):
+            seen_keys.append(api_key)
+            return _fetch(name, base_url, {"https://x.test/v1/models": body("seed")})
+
+        def resolver(raw):
+            # stand-in for secrets.resolve_placeholder
+            return "resolved-key-value"
+
+        outcome = sync_config(cfg, fetcher, key_resolver=resolver)
+        self.assertEqual(["resolved-key-value"], seen_keys)
+        self.assertFalse(outcome.providers[0].errors)
+
+    def test_literal_api_key_passes_through_without_resolver(self):
+        cfg = [
+            provider(
+                name="P",
+                models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
+                api_key="sk-literal",
+            )
+        ]
+        seen_keys: list = []
+
+        def fetcher(name, base_url, api_key):
+            seen_keys.append(api_key)
+            return _fetch(name, base_url, {"https://x.test/v1/models": body("seed")})
+
+        sync_config(cfg, fetcher)  # no key_resolver -> literal used as-is
+        self.assertEqual(["sk-literal"], seen_keys)
+
+    def test_legacy_two_arg_fetcher_is_still_supported(self):
+        """Backward compatibility: a fetcher with two positional args must keep
+        working without receiving the key argument."""
+        cfg = [
+            provider(
+                name="P",
+                models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
+                api_key="${input:chat.lm.secret.-x}",
+            )
+        ]
+        seen: list = []
+
+        def fetcher(name, base_url):
+            seen.append((name, base_url))
+            return _fetch(name, base_url, {"https://x.test/v1/models": body("seed")})
+
+        outcome = sync_config(cfg, fetcher, key_resolver=lambda raw: "unused")
+        self.assertEqual([("P", "https://x.test")], seen)
+        self.assertFalse(outcome.providers[0].errors)
+
+    def test_unresolvable_placeholder_is_not_sent_verbatim(self):
+        """A ${input:...} reference that fails to resolve must degrade to
+        'no key' — the placeholder text itself must never ride the wire as
+        an Authorization token."""
+        cfg = [
+            provider(
+                name="P",
+                models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
+                api_key="${input:chat.lm.secret.-gone}",
+            )
+        ]
+        seen_keys: list = []
+
+        def fetcher(name, base_url, api_key):
+            seen_keys.append(api_key)
+            return _fetch(name, base_url, {"https://x.test/v1/models": body("seed")})
+
+        # Case 1: resolver present but returns None (lookup missed).
+        sync_config(cfg, fetcher, key_resolver=lambda raw: None)
+        self.assertIsNone(seen_keys[0], "unresolved placeholder must be keyless")
+
+        # Case 2: no resolver at all — still keyless, never the template text.
+        seen_keys.clear()
+        sync_config(cfg, fetcher)
+        self.assertIsNone(seen_keys[0], "placeholder without resolver must be keyless")
+
+    def test_varargs_fetcher_receives_key(self):
+        """Regression: a fetcher declared as ``def fetch(*args)`` accepts a
+        third positional argument, so the resolved key must be passed through
+        rather than being silently dropped (which would send the request
+        unauthenticated)."""
+        cfg = [
+            provider(
+                name="P",
+                models=[{"id": "seed", "name": "S", "url": "https://x.test"}],
+                api_key="${input:chat.lm.secret.-x}",
+            )
+        ]
+        seen_keys: list = []
+
+        def fetcher(*args):
+            # args == (name, base_url, api_key)
+            seen_keys.append(args[2] if len(args) > 2 else None)
+            return _fetch(args[0], args[1], {"https://x.test/v1/models": body("seed")})
+
+        sync_config(cfg, fetcher, key_resolver=lambda raw: "the-key")
+        self.assertEqual(["the-key"], seen_keys)
+
+    def test_read_secret_copies_wal_sidecars(self):
+        """Regression: when a running VS Code instance leaves WAL sidecars next
+        to state.vscdb, _read_secret must copy them alongside the main file so
+        the snapshot is consistent; otherwise un-checkpointed pages are lost
+        and the lookup degrades to 'no key' (a 401)."""
+        import os
+        import sqlite3
+        import tempfile
+        from unittest.mock import patch as _patch
+
+        from clm_sync import secrets
+
+        copied: list = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)")
+            con.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                ("secret://chat.lm.secret.-x", b'{"type":"Buffer","data":[]}'),
+            )
+            con.commit()
+            con.close()
+            # Simulate a running instance that left WAL sidecars behind.
+            with open(db + "-wal", "wb") as fh:
+                fh.write(b"WAL-snapshot")
+            with open(db + "-shm", "wb") as fh:
+                fh.write(b"SHM-snapshot")
+
+            # Point the real _read_secret at this fixture and watch the copy
+            # destination via a wrapper around shutil.copyfile.
+            import shutil as _shutil
+
+            orig_copy = _shutil.copyfile
+
+            def spy_copy(src, dst, *a, **kw):
+                copied.append(dst)
+                return orig_copy(src, dst, *a, **kw)
+
+            with _patch.object(secrets, "_global_storage_db_path", return_value=db), _patch.object(
+                secrets, "_load_master_key", return_value=b"0" * 32
+            ), _patch.object(_shutil, "copyfile", side_effect=spy_copy):
+                # A 32-byte master key lets _read_secret reach the copy step;
+                # the empty data payload then decrypts to None (no crash).
+                secrets._read_secret("secret://chat.lm.secret.-x")
+
+            main_copies = [c for c in copied if c.endswith("state.vscdb")]
+            self.assertEqual(1, len(main_copies), "main file must be copied")
+            # The sidecars are copied next to the main copy, in order.
+            self.assertTrue(
+                any(c.endswith("state.vscdb-wal") for c in copied),
+                "WAL sidecar must be copied alongside the main file",
+            )
+            self.assertTrue(
+                any(c.endswith("state.vscdb-shm") for c in copied),
+                "SHM sidecar must be copied alongside the main file",
+            )
 
 
 class ConfigIoTest(unittest.TestCase):
@@ -544,6 +861,119 @@ class ConfigIoTest(unittest.TestCase):
                 fh.write('{"not": "an array"}')
             with self.assertRaises(ModelSyncError):
                 load_config(path)
+
+
+class SecretsTest(unittest.TestCase):
+    """Placeholder resolution using fully synthetic v10 fixtures.
+
+    No VS Code state database is ever touched; the expected payload is built
+    here with a known key, so key material in this module is fixture-only.
+    """
+
+    KEY = "0123456789abcdef0123456789abcdef"  # exactly 32 bytes (256 bits)
+    PLAINTEXT = "sk-synthetic-test-key"
+
+    def test_decrypt_v10_roundtrip(self):
+        from clm_sync.secrets import _decrypt_v10
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        key = self.KEY.encode()
+        nonce = b"\x00" * 12
+        payload = b"v10" + nonce + AESGCM(key).encrypt(nonce, self.PLAINTEXT.encode(), None)
+        self.assertEqual(self.PLAINTEXT, _decrypt_v10(payload, key))
+
+    def test_read_secret_via_injected_database(self):
+        import json as _json
+        import os
+        import sqlite3
+        import tempfile
+        from unittest.mock import patch as _patch
+
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        from clm_sync import secrets
+
+        nonce = b"\x07" * 12
+        ct_and_tag = AESGCM(self.KEY.encode()).encrypt(nonce, self.PLAINTEXT.encode(), None)
+        envelope = _json.dumps({"type": "Buffer", "data": list(b"v10" + nonce + ct_and_tag)})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "state.vscdb")
+            con = sqlite3.connect(db_path)
+            con.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)")
+            con.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                ("secret://chat.lm.secret.-test", envelope.encode()),
+            )
+            con.commit()
+            con.close()
+
+            # patch.object restores the originals on exit; a bare
+            # assignment + del would permanently clobber the real module
+            # functions and poison every later test in the module.
+            with _patch.object(secrets, "_global_storage_db_path", return_value=db_path), _patch.object(
+                secrets, "_load_master_key", return_value=self.KEY.encode()
+            ):
+                resolved = secrets.resolve_placeholder("${input:chat.lm.secret.-test}")
+        # Only the fixture constant is compared; never any real key.
+        self.assertEqual(self.PLAINTEXT, resolved)
+
+    def test_secret_resolution_failures_return_none(self):
+        """No resolution failure (missing package, damaged Local State, locked
+        DB) may escape resolve_placeholder - they all degrade to None."""
+        import os
+        import sqlite3
+        import tempfile
+        from unittest.mock import patch as _patch
+
+        from clm_sync import secrets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)")
+            con.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                ("secret://chat.lm.secret.-x", b'{"type":"Buffer","data":[]}'),
+            )
+            con.commit()
+            con.close()
+            bad_ls = os.path.join(tmp, "Local State")
+            with open(bad_ls, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+
+            with _patch.object(secrets, "_global_storage_db_path", return_value=db), _patch.object(
+                secrets, "_load_master_key", return_value=b"0" * 32
+            ):
+                # Empty data -> no payload -> None
+                self.assertIsNone(
+                    secrets.resolve_placeholder("${input:chat.lm.secret.-x}")
+                )
+                # Missing cryptography must surface as None, never an exception
+                def boom(payload, aes_key):
+                    raise secrets.SecretResolutionError(
+                        "cryptography package is required"
+                    )
+
+                with _patch.object(secrets, "_decrypt_v10", side_effect=boom):
+                    self.assertIsNone(
+                        secrets.resolve_placeholder("${input:chat.lm.secret.-x}")
+                    )
+
+            # A damaged Local State must yield a None master key, not a crash.
+            # Only the path is redirected; the real _load_master_key runs
+            # against the malformed file.  Assert on `is None` only so the key
+            # material (if any) never appears in a failure message.
+            with _patch.object(secrets, "_local_state_path", return_value=bad_ls):
+                self.assertIsNone(secrets._load_master_key())
+
+    def test_is_secret_placeholder(self):
+        from clm_sync.models import is_secret_placeholder
+
+        self.assertTrue(is_secret_placeholder("${input:chat.lm.secret.-abc}"))
+        self.assertTrue(is_secret_placeholder("${input:anything-else}"))
+        self.assertFalse(is_secret_placeholder("sk-literal"))
+        self.assertFalse(is_secret_placeholder(None))
 
 
 class CliTest(unittest.TestCase):
@@ -600,7 +1030,7 @@ class CliTest(unittest.TestCase):
                 fh.write(serialize(cfg))
             before = open(path, encoding="utf-8").read()
 
-            def failing(name, base_url, timeout=None):
+            def failing(name, base_url, timeout=None, api_key=None):
                 return FetchResult(
                     base_url=base_url,
                     provider_name=name,

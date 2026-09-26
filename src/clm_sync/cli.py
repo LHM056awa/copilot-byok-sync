@@ -12,6 +12,11 @@ from .config import load_config, write_config_atomic
 from .models import ModelSyncError, is_custom_endpoint
 from .sync import sync_config
 
+try:
+    from .secrets import resolve_placeholder
+except ImportError:  # cryptography not installed; placeholders become no-ops
+    resolve_placeholder = None
+
 EXIT_OK = 0
 EXIT_PARTIAL_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
@@ -58,6 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-delete",
         action="store_true",
         help="never remove models or their settings; only add/update",
+    )
+    parser.add_argument(
+        "--sort",
+        action="store_true",
+        help="rewrite each provider's model list in ascending model-id order "
+        "(lexicographic, case-sensitive); by default the existing order is "
+        "preserved and new models are appended",
     )
     parser.add_argument(
         "--timeout",
@@ -113,9 +125,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     try:
         outcome = sync_config(
             config,
-            fetcher=lambda name, base_url: fetch_models(name, base_url, timeout=args.timeout),
+            fetcher=lambda name, base_url, api_key: fetch_models(
+                name, base_url, timeout=args.timeout, api_key=api_key,
+            ),
             provider_names=args.providers,
             allow_delete=not args.no_delete,
+            key_resolver=resolve_placeholder,
+            sort_models=args.sort,
         )
     except ModelSyncError as exc:
         print(f"error: {exc}", file=sys.stderr)

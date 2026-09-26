@@ -16,6 +16,9 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+dependencies = [
+    "cryptography>=42.0.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
