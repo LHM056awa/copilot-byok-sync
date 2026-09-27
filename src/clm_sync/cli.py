@@ -7,14 +7,19 @@ import sys
 from typing import Optional, Sequence
 
 from . import __version__
-from .client import fetch_models
+from .client import fetch_credits, fetch_models
 from .config import load_config, write_config_atomic
-from .models import ModelSyncError, is_custom_endpoint
+from .models import ModelSyncError, endpoint_base_urls, is_custom_endpoint
 from .sync import sync_config
 
 try:
     from .secrets import resolve_placeholder
-except ImportError:  # cryptography not installed; placeholders become no-ops
+except ImportError:
+    # secrets.py only imports cleanly on Windows (it pulls in ctypes.wintypes
+    # for DPAPI) and with the cryptography package installed.  On any other
+    # platform, or without cryptography, placeholder resolution is a no-op:
+    # literal keys still work, ${input:...} references simply degrade to a
+    # keyless request (a 401).
     resolve_placeholder = None
 
 EXIT_OK = 0
@@ -72,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         "preserved and new models are appended",
     )
     parser.add_argument(
+        "--no-credits",
+        action="store_true",
+        help="skip the automatic balance lookup for known vendors (on by default)",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=15.0,
@@ -79,6 +89,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"clm-sync {__version__}")
     return parser
+
+
+def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
+    """Attach a display-only balance value to each synced provider.
+
+    Balances come from each provider's *known* balance endpoint (matched by
+    host); providers whose base URLs are not in the known table keep
+    ``credits=None`` (the report omits the line).  A failed or empty lookup is
+    recorded as "unavailable".  This is display-only: it never feeds the model
+    sync or the delete guard.
+
+    *targets_all* (``--all``) pairs each ``ProviderSyncResult`` with the
+    provider object it was built from via the result's ``config_index`` -- its
+    position in the post-sync config -- so duplicate provider names can never
+    mix up results and the pairing does not depend on list ordering.  When a
+    specific subset is targeted, names are guaranteed unique by
+    ``select_providers`` (a duplicate raises), so a name lookup is safe there.
+    """
+    from .client import has_credits_endpoint
+    from .sync import resolve_provider_key
+
+    if targets_all:
+        def provider_for(result):
+            idx = result.config_index
+            if idx is None or not 0 <= idx < len(outcome.config):
+                return None
+            prov = outcome.config[idx]
+            return prov if is_custom_endpoint(prov) else None
+    else:
+        custom = [p for p in outcome.config if is_custom_endpoint(p)]
+        by_name: dict = {}
+        for prov in custom:
+            if isinstance(prov.get("name"), str):
+                by_name.setdefault(prov["name"], prov)
+
+        def provider_for(result):
+            return by_name.get(result.name)
+
+    for result in outcome.providers:
+        prov = provider_for(result)
+        if prov is None:
+            continue
+        urls = endpoint_base_urls(prov.get("models"))
+        if not any(has_credits_endpoint(u) for u in urls):
+            continue  # no known balance endpoint -> omit balance line
+        key = resolve_provider_key(prov, key_resolver)
+        value = None
+        for url in urls:
+            value = fetch_credits(result.name, url, timeout=timeout, api_key=key)
+            if value is not None:
+                break
+        result.credits = value if value is not None else "unavailable"
 
 
 def render_report(outcome) -> str:
@@ -99,6 +161,8 @@ def render_report(outcome) -> str:
             )
         if provider.kept:
             lines.append(f"    kept    ({provider.kept}) with existing metadata")
+        if provider.credits is not None:
+            lines.append(f"    credits: {provider.credits}")
         if provider.skipped_deletion:
             lines.append("    deletion skipped: keeping existing models")
         if provider.discarded_invalid:
@@ -136,6 +200,16 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     except ModelSyncError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+
+    # Auto-fetch balances unless --no-credits is given.  A failure here never
+    # affects model sync or the delete guard: the value is display-only.
+    if not args.no_credits:
+        enrich_with_credits(
+            outcome,
+            timeout=args.timeout,
+            key_resolver=resolve_placeholder,
+            targets_all=args.providers is None,
+        )
 
     total = len(outcome.providers)
     failed = [p for p in outcome.providers if not p.ok]

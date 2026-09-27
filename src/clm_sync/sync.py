@@ -317,7 +317,7 @@ def _select_positions(
     return [i for i, p in enumerate(config) if is_custom_endpoint(p)]
 
 
-def _resolve_provider_key(
+def resolve_provider_key(
     provider: Dict[str, Any], key_resolver
 ) -> Optional[str]:
     """Return the provider's effective API key for outbound requests.
@@ -394,7 +394,8 @@ def sync_config(
     new models are appended.
     """
     working = copy.deepcopy(config)
-    providers = [working[i] for i in _select_positions(config, provider_names)]
+    positions = _select_positions(config, provider_names)
+    providers = [working[i] for i in positions]
 
     calls = plan_calls(providers)
     pass_key = _fetcher_takes_key(fetcher)
@@ -405,7 +406,7 @@ def sync_config(
     for provider, base_url in calls:
         name = provider.get("name") or "<unnamed>"
         if pass_key:
-            api_key = _resolve_provider_key(provider, key_resolver)
+            api_key = resolve_provider_key(provider, key_resolver)
             results_by_provider.setdefault(id(provider), []).append(
                 fetcher(name, base_url, api_key)
             )
@@ -415,15 +416,18 @@ def sync_config(
             )
 
     provider_results: List[ProviderSyncResult] = []
-    for provider in providers:
-        provider_results.append(
-            apply_provider_sync(
-                provider,
-                results_by_provider.get(id(provider), []),
-                allow_delete=allow_delete,
-                sort_models=sort_models,
-            )
+    for provider, config_index in zip(providers, positions):
+        result = apply_provider_sync(
+            provider,
+            results_by_provider.get(id(provider), []),
+            allow_delete=allow_delete,
+            sort_models=sort_models,
         )
+        # Remember where this provider sits in the post-sync config list so a
+        # consumer can pair the result back to its exact object by index
+        # instead of relying on list ordering.
+        result.config_index = config_index
+        provider_results.append(result)
 
     changed = working != config
     return SyncOutcome(config=working, changed=changed, providers=provider_results)

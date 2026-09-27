@@ -11,18 +11,23 @@ import unittest
 from unittest.mock import patch
 
 from clm_sync import cli
-from clm_sync.client import TransportError, parse_models_payload, resolve_models_url
+from clm_sync.client import (
+    TransportError,
+    _CREDITS_ENDPOINTS,
+    _json_path,
+    fetch_credits,
+    has_credits_endpoint,
+    parse_credits_payload,
+    parse_models_payload,
+    resolve_models_url,
+)
 from clm_sync.config import load_config, serialize, write_config_atomic
 from clm_sync.models import ModelSyncError, base_display_name
 from clm_sync.sync import sync_config
 from clm_sync.models import FetchResult
 
 
-def _ok(url: str, timeout=None) -> str:
-    raise AssertionError(f"unexpected real HTTP call to {url}")
-
-
-def fake_transport(route: dict[str, object], api_key_sink: list = None):
+def fake_transport(route: dict[str, object], api_key_sink: list[object] | None = None):
     """Build a transport keyed by requested url.
 
     route values are either a body string or an Exception to raise.
@@ -760,10 +765,13 @@ class SyncTest(unittest.TestCase):
         ]
         seen_keys: list = []
 
-        def fetcher(*args):
-            # args == (name, base_url, api_key)
+        def fetcher(*args: object):
+            # args == (name, base_url, api_key).  Guard each index on the
+            # argument count so the access is provably in-bounds.
             seen_keys.append(args[2] if len(args) > 2 else None)
-            return _fetch(args[0], args[1], {"https://x.test/v1/models": body("seed")})
+            name = args[0] if len(args) > 0 else ""
+            base_url = args[1] if len(args) > 1 else ""
+            return _fetch(name, base_url, {"https://x.test/v1/models": body("seed")})
 
         sync_config(cfg, fetcher, key_resolver=lambda raw: "the-key")
         self.assertEqual(["the-key"], seen_keys)
@@ -976,6 +984,244 @@ class SecretsTest(unittest.TestCase):
         self.assertFalse(is_secret_placeholder(None))
 
 
+class CreditsTest(unittest.TestCase):
+    """Balance lookups only for *known* hosts; everything else is omitted."""
+
+    def test_only_known_hosts_have_balance_endpoint(self):
+        self.assertTrue(has_credits_endpoint("https://api.deepseek.com"))
+        self.assertTrue(has_credits_endpoint("https://api.deepseek.com/v1"))
+        self.assertTrue(has_credits_endpoint("https://openrouter.ai/v1/chat/completions"))
+        # Unknown gateway hosts are NOT queried.  The negative fixtures use
+        # synthetic names on purpose: this test file must never name a real
+        # third-party gateway.
+        self.assertFalse(has_credits_endpoint("https://unknown-gateway.example.com"))
+        self.assertFalse(has_credits_endpoint("https://x.test"))
+
+    def test_fetch_credits_unknown_host_is_none_without_network(self):
+        # A transport that raises proves we never hit the network for unknown
+        # hosts (the lookup is skipped before any request is made).
+        def boom(url, timeout=None, api_key=None):
+            raise AssertionError("must not fetch for unknown host")
+
+        self.assertIsNone(
+            fetch_credits("P", "https://unknown-gateway.example.com", transport=boom)
+        )
+
+    def test_fetch_credits_known_host_success(self):
+        def ok(url, timeout=None, api_key=None):
+            self.assertEqual(url, "https://api.deepseek.com/user/balance")
+            return (
+                '{"is_available": true, "balance_infos": '
+                '[{"currency": "CNY", "total_balance": "1.23"}]}'
+            )
+
+        self.assertEqual(
+            "1.23 CNY", fetch_credits("DeepSeek", "https://api.deepseek.com", transport=ok)
+        )
+
+    def test_fetch_credits_failure_is_none(self):
+        def boom(url, timeout=None, api_key=None):
+            raise TransportError("HTTP 500")
+
+        self.assertIsNone(
+            fetch_credits("DeepSeek", "https://api.deepseek.com", transport=boom)
+        )
+
+    def test_parse_credits_payload_known_fields(self):
+        spec = _CREDITS_ENDPOINTS["api.deepseek.com"]
+        self.assertEqual(
+            "1.23 CNY",
+            parse_credits_payload(
+                '{"balance_infos": [{"total_balance": "1.23"}]}', spec
+            ),
+        )
+
+    def test_parse_credits_payload_fallback_when_fields_missing(self):
+        # Valid JSON, but none of the declared fields is present (the vendor
+        # reshaped its response): a truncated raw body is returned so the
+        # operator can see what changed.
+        spec = _CREDITS_ENDPOINTS["api.deepseek.com"]
+        raw = '{"unexpected_field": "' + "x" * 200 + '"}'
+        out = parse_credits_payload(raw, spec)
+        self.assertIsInstance(out, str, "fallback must yield a string")
+        # Short-circuit on isinstance so the optional `out` is provably a
+        # `str` before `len` / `endswith` are touched (assertIsInstance does
+        # not narrow the type for the checker).
+        self.assertTrue(isinstance(out, str) and len(out) <= 123, "fallback must truncate")
+        self.assertTrue(isinstance(out, str) and out.endswith("..."))
+
+    def test_parse_credits_payload_non_json_is_none(self):
+        # A 200 + HTML error page (or gateway message) is not a balance: it
+        # must not be echoed into the report as if it were one.
+        spec = _CREDITS_ENDPOINTS["api.deepseek.com"]
+        self.assertIsNone(parse_credits_payload("<html>Gateway Timeout</html>", spec))
+
+    def test_parse_credits_payload_multi_field_is_labelled(self):
+        # openrouter declares two fields: every surviving value carries its
+        # own label, so a missing metric can never be mis-read as the other.
+        spec = _CREDITS_ENDPOINTS["openrouter.ai"]
+        self.assertEqual(
+            "credits: 500 USD, used: 5.0 USD",
+            parse_credits_payload(
+                '{"data": {"total_credits": 500, "total_usage": 500}}', spec
+            ),
+        )
+        # Only one metric present: still labelled, because the spec declares
+        # two fields (a bare "5.0 USD" would be ambiguous).
+        self.assertEqual(
+            "used: 5.0 USD",
+            parse_credits_payload('{"data": {"total_usage": 500}}', spec),
+        )
+
+    def test_parse_credits_payload_string_number_is_scaled(self):
+        # Vendors that report the number as a string ("10000") must still
+        # have the spec's scale applied, not silently skip it.
+        spec = _CREDITS_ENDPOINTS["api.novita.ai"]
+        self.assertEqual(
+            "1.0 USD",
+            parse_credits_payload('{"availableBalance": "10000"}', spec),
+        )
+
+    def test_parse_credits_payload_empty_is_none(self):
+        spec = _CREDITS_ENDPOINTS["api.deepseek.com"]
+        self.assertIsNone(parse_credits_payload("   ", spec))
+
+    def test_json_path_index_only_accepts_ascii_decimal(self):
+        """Point 2: a bracketed index is a valid path part only when it is a
+        plain ASCII decimal integer.  Unicode digits like '2' are rejected
+        even though str.isdigit accepts them, because int('2') would raise."""
+        payload = {"data": [{"total_balance": "1.00"}, {"total_balance": "2.00"}]}
+        # ASCII decimal indices resolve.
+        self.assertTrue(_json_path(payload, "data[0].total_balance")[0])
+        self.assertEqual("1.00", _json_path(payload, "data[0].total_balance")[1])
+        self.assertEqual("2.00", _json_path(payload, "data[1].total_balance")[1])
+        # Unicode superscript two: isdigit() is True but int() raises, so the
+        # path must be rejected (found=False), not crash.
+        self.assertFalse(_json_path(payload, "data[\u00b2]")[0])
+        # Other malformed forms are likewise rejected, never silently ignored.
+        self.assertFalse(_json_path(payload, "data[]")[0])
+        self.assertFalse(_json_path(payload, "data[-1]")[0])
+        self.assertFalse(_json_path(payload, "data[1.5]")[0])
+        self.assertFalse(_json_path(payload, "data[abc]")[0])
+
+    def test_literal_api_key_reaches_credits_lookup(self):
+        """A2: the credits path must reuse the same key resolution as model
+        sync — a literal apiKey reaches fetch_credits verbatim (previously the
+        CLI sent a keyless request here, and a missing apiKey would even raise
+        AttributeError on None)."""
+        cfg = [
+            provider(
+                name="P",
+                models=[{"id": "a", "url": "https://api.deepseek.com"}],
+                api_key="sk-literal",
+            )
+        ]
+        # The remote still advertises the seeded model, so the synced config
+        # keeps its endpoint urls (an empty success would trigger deletion).
+        outcome = sync_config(cfg, lambda n, u: FetchResult(u, n, True, ["a"]))
+        seen: list = []
+
+        def recorder(name, base_url, timeout=None, api_key=None):
+            seen.append(api_key)
+            return "1.23 CNY"
+
+        with patch("clm_sync.cli.fetch_credits", side_effect=recorder):
+            cli.enrich_with_credits(outcome, timeout=1, key_resolver=None, targets_all=True)
+
+        self.assertEqual(["sk-literal"], seen)
+        self.assertEqual("1.23 CNY", outcome.providers[0].credits)
+
+    def test_all_mode_pairs_duplicate_names_by_object(self):
+        """A4: under --all, each result is paired with its own provider object
+        so two same-named providers never mix up their balance lookup.  The
+        buggy name-keyed lookup would have fetched the *first* provider's host
+        and key for both."""
+        cfg = [
+            provider(
+                name="Dup",
+                models=[{"id": "a", "url": "https://api.deepseek.com"}],
+                api_key="sk-deepseek",
+            ),
+            provider(
+                name="Dup",
+                models=[{"id": "b", "url": "https://api.moonshot.cn"}],
+                api_key="sk-moonshot",
+            ),
+        ]
+
+        def keep(name, url):
+            # Each remote keeps advertising its own model, so both providers
+            # keep their endpoint urls in the synced config.
+            ids = ["a"] if "deepseek" in url else ["b"]
+            return FetchResult(base_url=url, provider_name=name, success=True, model_ids=ids)
+
+        outcome = sync_config(cfg, keep)
+
+        calls: list = []
+
+        def recorder(name, base_url, timeout=None, api_key=None):
+            calls.append((base_url, api_key))
+            return "1.23 CNY"
+
+        with patch("clm_sync.cli.fetch_credits", side_effect=recorder):
+            cli.enrich_with_credits(outcome, timeout=1, key_resolver=None, targets_all=True)
+
+        # Each provider looked up its OWN host and key, in provider order.
+        self.assertEqual(
+            [
+                ("https://api.deepseek.com", "sk-deepseek"),
+                ("https://api.moonshot.cn", "sk-moonshot"),
+            ],
+            calls,
+        )
+        self.assertEqual("1.23 CNY", outcome.providers[0].credits)
+        self.assertEqual("1.23 CNY", outcome.providers[1].credits)
+
+    def test_all_mode_pairing_does_not_depend_on_provider_order(self):
+        """Point 3: pairing is by each result's config_index, not by the list
+        order of outcome.providers.  Reversing the result list (as a future
+        reordering of sync_config's appends might do) must not shift which
+        provider a result's balance comes from."""
+        cfg = [
+            provider(
+                name="A",
+                models=[{"id": "a", "url": "https://api.deepseek.com"}],
+                api_key="sk-a",
+            ),
+            provider(
+                name="B",
+                models=[{"id": "b", "url": "https://api.moonshot.cn"}],
+                api_key="sk-b",
+            ),
+        ]
+
+        def keep(name, url):
+            ids = ["a"] if "deepseek" in url else ["b"]
+            return FetchResult(base_url=url, provider_name=name, success=True, model_ids=ids)
+
+        outcome = sync_config(cfg, keep)
+        # Each result carries its own config_index (0 for A, 1 for B).
+        self.assertEqual([0, 1], [r.config_index for r in outcome.providers])
+
+        # Simulate a future reordering of the results list.
+        outcome.providers.reverse()
+
+        def recorder(name, base_url, timeout=None, api_key=None):
+            # A distinguishable value keyed by host, so a shifted pairing
+            # (A's result pulling B's balance) would be caught.
+            return "deepseek" if "deepseek" in base_url else "moonshot"
+
+        with patch("clm_sync.cli.fetch_credits", side_effect=recorder):
+            cli.enrich_with_credits(outcome, timeout=1, key_resolver=None, targets_all=True)
+
+        # A's result (config_index 0) must hold deepseek's value and B's
+        # result (config_index 1) must hold moonshot's, regardless of the
+        # (now reversed) list order.
+        by_index = {r.config_index: r for r in outcome.providers}
+        self.assertEqual("deepseek", by_index[0].credits)
+        self.assertEqual("moonshot", by_index[1].credits)
+
+
 class CliTest(unittest.TestCase):
     def test_package_main_entry_executes_cli(self):
         """Regression: `python -m clm_sync` must actually run the CLI."""
@@ -1010,7 +1256,7 @@ class CliTest(unittest.TestCase):
                     success=True,
                     model_ids=["seed"],
                 ),
-            ):
+            ), patch("clm_sync.cli.fetch_credits", return_value="100 USD"):
                 code = cli.run(["--config", path, "--all", "--dry-run"])
             self.assertEqual(cli.EXIT_OK, code)
             self.assertEqual(before, open(path, encoding="utf-8").read())
@@ -1041,6 +1287,7 @@ class CliTest(unittest.TestCase):
             stderr = io.StringIO()
             with (
                 patch("clm_sync.cli.fetch_models", side_effect=failing),
+                patch("clm_sync.cli.fetch_credits", return_value=None),
                 patch("sys.stderr", stderr),
             ):
                 code = cli.run(["--config", path, "--all"])

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import socket
 import ssl
 import urllib.error
@@ -152,7 +153,7 @@ def default_transport(
     """
     request = urllib.request.Request(url, method="GET")
     request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "clm-sync/0.2.0")
+    request.add_header("User-Agent", "clm-sync/0.3.0")
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")
     try:
@@ -227,3 +228,186 @@ def fetch_models(
         model_ids=model_ids,
         model_metadata=model_metadata,
     )
+
+def _json_path(payload: Any, path: str) -> tuple[bool, Any]:
+    """Resolve a dotted JSON path such as ``balance_infos[0].total_balance``.
+
+    Each segment is a key optionally followed by integer ``[n]`` index parts.
+    An index part is accepted only when its content is a plain ASCII decimal
+    non-negative integer (``[0]``, ``[12]``).  Everything else is a malformed
+    spec path and is rejected outright rather than silently ignored, so a
+    mistyped path cannot resolve to the wrong value.  Concretely, rejected
+    bracket contents include: empty (``[]``), non-numeric (``[abc]``, ``[²]``),
+    signed (``[-1]``), and non-integer (``[1.5]``).  Unicode digits such as
+    ``"²"`` are rejected even though ``str.isdigit`` would accept them, because
+    ``int("²")`` raises ``ValueError`` -- the check is therefore an explicit
+    ASCII ``[0-9]+`` match, not ``str.isdigit``.
+
+    Returns ``(found, value)`` so callers can tell "key missing" apart from a
+    legitimate ``0`` / ``False`` value.
+    """
+    cur = payload
+    for seg in path.split("."):
+        brackets = re.findall(r"\[([^\]]*)\]", seg)
+        if any(re.fullmatch(r"[0-9]+", b) is None for b in brackets):
+            return False, None
+        key = re.sub(r"\[[^\]]*\]", "", seg).strip()
+        if not isinstance(cur, dict) or key not in cur:
+            return False, None
+        cur = cur[key]
+        for b in brackets:
+            i = int(b)
+            if not isinstance(cur, list) or not 0 <= i < len(cur):
+                return False, None
+            cur = cur[i]
+    return True, cur
+
+
+# Balance endpoints for the vendors whose balance we know how to read, ported
+# from MeteorNOX/DeepSeek-Balance-Whale-Widget's API_TEMPLATES.  Keyed by the
+# host (netloc) of the provider's base URL.  Only these *known* endpoints are
+# ever queried; any other host gets no balance lookup at all (its balance line
+# is simply omitted from the report rather than shown as "unavailable").
+#
+# Each spec carries: the absolute balance URL, a list of
+# ``(json_path, label, scale)`` fields to extract, and an optional currency.
+_CREDITS_ENDPOINTS: Dict[str, Dict[str, Any]] = {
+    "api.deepseek.com": {
+        "url": "https://api.deepseek.com/user/balance",
+        "fields": [("balance_infos[0].total_balance", "balance", 1.0)],
+        "currency": "CNY",
+    },
+    "openrouter.ai": {
+        "url": "https://openrouter.ai/api/v1/credits",
+        "fields": [
+            ("data.total_credits", "credits", 1.0),
+            ("data.total_usage", "used", 0.01),  # reported in cents
+        ],
+        "currency": "USD",
+    },
+    "api.moonshot.cn": {
+        "url": "https://api.moonshot.cn/v1/users/me/balance",
+        "fields": [("data.available_balance", "available", 1.0)],
+        "currency": "CNY",
+    },
+    "api.moonshot.ai": {
+        "url": "https://api.moonshot.ai/v1/users/me/balance",
+        "fields": [("data.available_balance", "available", 1.0)],
+        "currency": "USD",
+    },
+    "api.stepfun.com": {
+        "url": "https://api.stepfun.com/v1/accounts",
+        "fields": [("balance", "balance", 1.0)],
+        "currency": "CNY",
+    },
+    "api.novita.ai": {
+        "url": "https://api.novita.ai/v3/user/balance",
+        "fields": [("availableBalance", "available", 0.0001)],
+        "currency": "USD",
+    },
+}
+
+
+def _credits_spec_for(base_url: str) -> Optional[Dict[str, Any]]:
+    """Return the balance-endpoint spec for *base_url*'s host, or ``None``."""
+    cleaned = (base_url or "").strip()
+    if not cleaned:
+        return None
+    netloc = urlsplit(cleaned).netloc.lower()
+    return _CREDITS_ENDPOINTS.get(netloc)
+
+
+def has_credits_endpoint(base_url: str) -> bool:
+    """True when *base_url* belongs to a host with a known balance endpoint.
+
+    Only these hosts are worth querying; the report omits the balance line
+    for everything else instead of guessing a path that does not exist.
+    """
+    return _credits_spec_for(base_url) is not None
+
+
+def parse_credits_payload(body: str, spec: Dict[str, Any]) -> Optional[str]:
+    """Render a known-endpoint balance body into a short display string.
+
+    Extracts each ``(json_path, label, scale)`` field declared in *spec* and
+    formats it (appending the currency).  Returns ``None`` when the body is
+    empty or not valid JSON (an HTML error page or gateway response carries no
+    readable balance, so echoing it would mislead).  When the JSON parses but
+    none of the declared fields is present — e.g. the vendor reshaped its
+    response — a truncated raw body is returned so the operator can see what
+    changed.  A single field is returned bare; multiple fields are labelled.
+    """
+    text = (body or "").strip()
+    if not text:
+        return None
+
+    try:
+        payload: Any = json.loads(text)
+    except json.JSONDecodeError:
+        # Non-JSON body (HTML error page, gateway message): nothing readable.
+        return None
+
+    parts: list[tuple[str, str]] = []
+    fields = spec.get("fields", [])
+    if isinstance(payload, (dict, list)):
+        for json_path, label, scale in fields:
+            found, value = _json_path(payload, json_path)
+            if not found or value is None:
+                continue
+            # Some vendors report the number as a string (e.g. "1.23"); coerce
+            # so the scale factor still applies instead of being skipped.
+            if isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+            if isinstance(value, (int, float)) and scale != 1.0:
+                value = value * scale
+            rendered = str(value)
+            if spec.get("currency"):
+                rendered += f" {spec['currency']}"
+            parts.append((label, rendered))
+
+    if parts:
+        # A spec that declares a single field reports its value bare (e.g.
+        # "1.23 CNY").  A multi-field spec always labels every surviving value
+        # (e.g. "used: 5 USD"), so a missing or reshaped field can never be
+        # mis-read as a different metric.
+        if len(fields) == 1:
+            return parts[0][1]
+        return ", ".join(f"{label}: {val}" for label, val in parts)
+
+    return text[:120] + ("..." if len(text) > 120 else "")
+
+
+def fetch_credits(
+    provider_name: str,
+    base_url: str,
+    timeout: Optional[float] = DEFAULT_TIMEOUT,
+    transport: Optional[Transport] = None,
+    api_key: Optional[str] = None,
+) -> Optional[str]:
+    """Fetch a provider's balance from its *known* balance endpoint.
+
+    Only hosts present in :data:`_CREDITS_ENDPOINTS` are queried; any other
+    host returns ``None`` without a network call (the report simply omits the
+    balance line).  For a known host, a request or parse failure also yields
+    ``None`` so a missing/failed balance endpoint never disturbs model
+    syncing.  Returns a short, human-readable value.
+    """
+    spec = _credits_spec_for(base_url)
+    if spec is None:
+        return None
+
+    url = spec["url"]
+    call = transport or default_transport
+    try:
+        body = call(url, timeout, api_key)
+    except TransportError as exc:
+        LOGGER.debug("%s: credits %s failed: %s", provider_name, url, exc)
+        return None
+    except Exception as exc:  # defensive: never let one endpoint abort the run
+        LOGGER.debug("%s: credits %s unexpected: %s", provider_name, url, exc)
+        return None
+
+    return parse_credits_payload(body, spec)

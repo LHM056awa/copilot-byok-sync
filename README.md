@@ -40,6 +40,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 | `--dry-run` | 只显示变更，不实际写入文件 |
 | `--no-delete` | 只添加远端发现的新模型，不删除或覆盖本地已有模型 |
 | `--sort` | 顺带把每个端点的模型列表按 id 字典序升序（大小写敏感）重排；默认保留原顺序 |
+| `--no-credits` | 跳过自动余额查询 |
 | `--timeout SECONDS` | 请求超时时间（秒），默认 15 |
 | `--version` | 显示版本信息 |
 
@@ -78,6 +79,35 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 |  缺失 | 否 | 请求不带头，端点自行决定 |
 
 若 `cryptography` 包未安装，占位符解析会静默降级（返回 401），不影响其他 provider 的同步。
+
+> **平台限制：** 占位符解析依赖 Windows 的 DPAPI 与 VS Code 的 Windows 存储路径，**仅在 Windows 上生效**。在 macOS / Linux 上（或 `cryptography` 缺失时）解析自动降级为无 key 请求——字面 key 正常同步，占位符 provider 会得到 401，属预期行为而非故障。
+
+## 余额查询
+
+一次同步运行结束后（含 `--dry-run`），未指定 `--no-credits` 时，工具会自动查询 base URL 属于**已知厂商端点**的 provider 的账户余额，并在报告里对应 provider 下追加一行 `credits:`（示例值）：
+
+```
+[changes] DeepSeek
+    credits: 12.34 CNY
+```
+
+匹配依据是 URL 的**域名**，与你在配置里写的 provider 名无关。当前已知端点：
+
+| 域名 | 余额端点 | 货币 |
+| - | - | - |
+| `api.deepseek.com` | `/user/balance` | CNY |
+| `openrouter.ai` | `/api/v1/credits` | USD |
+| `api.moonshot.cn` | `/v1/users/me/balance` | CNY |
+| `api.moonshot.ai` | `/v1/users/me/balance` | USD |
+| `api.stepfun.com` | `/v1/accounts` | CNY |
+| `api.novita.ai` | `/v3/user/balance` | USD |
+
+行为规则：
+
+- **未知域名不查询。**
+- **查询失败显示 `unavailable`。** 已知端点的请求失败、或响应里没有可解析的字段时，`credits:` 行显示 `unavailable`；余额是纯展示信息，**不影响模型同步与删除保护逻辑**。
+- 需要鉴权的 provider，余额请求与模型同步复用同一把 API key。
+- `--no-credits` 可完全跳过余额查询。
 
 ## 新增模型的字段
 
@@ -143,7 +173,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 }
 ```
 
-> `${env:APPDATA}` 是 VS Code 任务的环境变量替换（Windows 下展开为 `C:\Users\<你>\AppData\Roaming`）。
+**双击运行的批处理脚本。** 仓库根目录还提供 `sync-global-models.bat`，双击即可对全局配置执行与上述任务等价的同步。
 
 ## 开发
 
@@ -169,6 +199,8 @@ copilot-byok-sync/
 │   └── sync.py         # 核心同步逻辑
 ├── tests/
 │   └── test_sync.py
+├── sync-global-models.bat  # 双击同步全局配置
+├── CHANGELOG.md
 └── README.md
 ```
 

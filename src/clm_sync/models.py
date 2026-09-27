@@ -36,6 +36,12 @@ class ProviderSyncResult:
     # Entries that lacked a usable string id and were discarded from the
     # synced model list.
     discarded_invalid: list[Any] = field(default_factory=list)
+    # Optional /v1/credits balance string, populated when credits are fetched.
+    credits: Optional[str] = None
+    # Index of this result's provider object inside the (post-sync) config
+    # list.  Populated by sync_config; lets a consumer pair a result back to
+    # its exact provider by index rather than relying on list-ordering.
+    config_index: Optional[int] = None
 
     @property
     def ok(self) -> bool:
