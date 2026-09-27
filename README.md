@@ -145,6 +145,29 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 **无法识别 id 的条目会被直接清理。** 模型条目必须提供**非空的字符串** `id` 才有意义并参与同步。缺少 `id`、`id` 为空、或 `id` 非字符串、乃至不是对象的条目，在配置文件中毫无意义，会被**直接丢弃**（所有模式下都会清理，与 `--no-delete` 无关）。运行报告会对每个 provider 列出被丢弃的条目内容（`discarded invalid entries`）。
 
+## 报告着色
+
+在**交互式终端**（如 Windows Terminal、系统终端）中运行时，运行报告会自动着色以便快速定位关键信息；各行颜色含义：
+
+| 报告行 | 颜色 | 含义 |
+| - | - | - |
+| `[changes]` / provider 名 | 绿 / 加粗 | 该 provider 有变更；名字加粗作定位锚点 |
+| `[unchanged]` / `kept ...` | 灰（淡） | 无实质变化，弱化显示 |
+| `added (...)` | 绿 | 新加入的模型 |
+| `removed (...)` / `error: ...` | 红 | 被删除的模型 / 请求失败 |
+| `credits: ...` | 青 | 账户余额（纯展示信息） |
+| `deletion skipped ...` / `discarded invalid entries ...` / `warning: no endpoint url ...` | 黄 | 需要注意的提示（删除被跳过、无效条目被清理、端点缺失） |
+| `Summary: ...` | 加粗 | 汇总行 |
+
+**着色启用条件：**
+
+- 仅当标准输出（stdout）是**交互式 TTY**（终端直接显示）时输出 ANSI 颜色。
+- 当 stdout 被**重定向或管道**（如 `> log`、`| grep`）时自动输出纯文本，日志保持干净。
+- 设置环境变量 **`NO_COLOR`**（任意值，如 `NO_COLOR=1`）可全局强制关闭颜色。
+- 打印到标准错误（stderr）的机器可读副本**始终是纯文本**（不带色码），供脚本 / CI 抓取。
+
+颜色**默认自动探测**：交互式终端直接显示时上色，重定向 / 管道 / 设置了 `NO_COLOR` 时自动输出纯文本，无需任何手动操作。`NO_COLOR`（如 `NO_COLOR=1`）只是可选开关，仅当你的终端**支持 TTY 但无法渲染 ANSI**（老版 conhost、部分远程会话）而看到裸转义码时才需手动设置；现代 Windows Terminal 无需理会。
+
 ## 工作区推荐配置
 
 在 `.vscode/tasks.json` 中添加以下任务，让它变成快捷键。该任务同步的是**全局配置**（用户数据目录下 VS Code 实际生效的文件，`%APPDATA%\Code\User\chatLanguageModels.json`）：
@@ -155,7 +178,6 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
   "tasks": [
     {
       "label": "Sync Custom Endpoints",
-      "type": "shell",
       "command": "python",
       "args": [
         "-m",
@@ -168,12 +190,35 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
         "kind": "build",
         "isDefault": true
       }
+    },
+    {
+      "label": "Sync Custom Endpoints in WT",
+      "command": "wt",
+      "args": [
+        "-w",
+        "0",
+        "cmd",
+        "/c",
+        "python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
+      ],
+      "presentation": {
+        "reveal": "silent",
+        "close": true
+      }
     }
   ]
 }
 ```
 
-**双击运行的批处理脚本。** 仓库根目录还提供 `sync-global-models.bat`，双击即可对全局配置执行与上述任务等价的同步。
+**任务说明：**
+
+- `Sync Custom Endpoints`：在 VS Code 集成终端里同步全局配置。
+- `Sync Custom Endpoints in WT`：通过 `wt`（Windows Terminal）弹出一个新窗口运行同步，报告直接显示在窗口里（交互终端下自动着色，见「报告着色」），结尾 `pause` 停住便于查看。
+
+**双击运行的批处理脚本。** 仓库根目录还提供：
+
+- `sync-global-models.bat` — 双击即在 cmd 窗口对全局配置执行与上述任务等价的同步。
+- `deploy-user-tasks.bat`（调用 `deploy_user_tasks.py`）— 把工作区 `.vscode/tasks.json` 里的任务**合并**到用户级 `%APPDATA%\Code\User\tasks.json`，使任务对**所有** VS Code 窗口生效。合并语义按 `label` 匹配：同名任务原地更新、新任务追加、用户级已有的其他任务与字段（`dependencies` 等）**原样保留**；文件损坏时中止且不动原文件，无备份、原子写入。用法：`python deploy_user_tasks.py`（或双击 `deploy-user-tasks.bat`）。
 
 ## 开发
 
@@ -188,10 +233,12 @@ python -m pytest tests/test_sync.py -v
 
 ```
 copilot-byok-sync/
+├── .vscode/
+│   └── tasks.json            # 工作区级同步任务（含 WT 窗口版）
 ├── src/clm_sync/
 │   ├── __init__.py
 │   ├── __main__.py
-│   ├── cli.py          # 命令行入口
+│   ├── cli.py          # 命令行入口（报告终端自动着色）
 │   ├── client.py       # HTTP 请求（含 Authorization 头）
 │   ├── config.py       # 读写 chatLanguageModels.json
 │   ├── models.py       # 数据结构
@@ -199,7 +246,9 @@ copilot-byok-sync/
 │   └── sync.py         # 核心同步逻辑
 ├── tests/
 │   └── test_sync.py
-├── sync-global-models.bat  # 双击同步全局配置
+├── sync-global-models.bat   # 双击同步全局配置（cmd 窗口）
+├── deploy_user_tasks.py    # 把工作区任务合并到用户级 tasks.json（label 级合并）
+├── deploy-user-tasks.bat   # 上一条的双击入口
 ├── CHANGELOG.md
 └── README.md
 ```

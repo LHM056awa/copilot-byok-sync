@@ -4,6 +4,16 @@ All notable changes to `clm-sync` are documented in this file.
 
 ---
 
+## 0.5.0 (2026-09-27)
+
+### Added
+
+- **报告终端自动着色**：stdout 为交互式 TTY 时运行报告带 ANSI 颜色（`[changes]`/`added` 绿、`removed`/`error` 红、`credits` 青、各类 warning 黄、汇总行加粗）；重定向 / 管道 / 设置 `NO_COLOR` 时自动回退纯文本；stderr 机器可读副本恒无色。
+- **`deploy_user_tasks.py` + `deploy-user-tasks.bat`**：把工作区 `.vscode/tasks.json` 按 `label` 合并进用户级 `%APPDATA%\Code\User\tasks.json`（同名更新、新任务追加、用户级其他任务/字段原样保留）；无备份、原子写入、目标文件损坏时中止不动原文件。
+- 工作区 `.vscode/tasks.json` 新增 `Sync Custom Endpoints in WT` 任务：经 `wt`（Windows Terminal）弹窗运行同步，报告直接显示在窗口内（交互终端自动着色）。
+
+---
+
 ## 0.4.0 (2026-09-27)
 
 ### Fixed

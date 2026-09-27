@@ -3,7 +3,6 @@
 	"tasks": [
 		{
 			"label": "Sync Custom Endpoints",
-			"type": "shell",
 			"command": "python",
 			"args": [
 				"-m",
@@ -15,6 +14,21 @@
 			"group": {
 				"kind": "build",
 				"isDefault": true
+			}
+		},
+		{
+			"label": "Sync Custom Endpoints in WT",
+			"command": "wt",
+			"args": [
+				"-w",
+				"0",
+				"cmd",
+				"/c",
+				"python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
+			],
+			"presentation": {
+				"reveal": "silent",
+				"close": true
 			}
 		}
 	]

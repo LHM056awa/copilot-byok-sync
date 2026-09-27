@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Optional, Sequence
 
@@ -143,15 +144,74 @@ def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
         result.credits = value if value is not None else "unavailable"
 
 
-def render_report(outcome) -> str:
+# ---------------------------------------------------------------------------
+# Output colouring
+#
+# The report is coloured with ANSI escape codes when stdout is an interactive
+# terminal (e.g. a Windows Terminal / PowerShell prompt), so status lines are
+# easy to scan.  It stays plain text when stdout is piped/redirected or when
+# the NO_COLOR convention is honoured, so logs and CI captures remain clean.
+# The machine-readable copy sent to stderr is *always* uncoloured.
+# ---------------------------------------------------------------------------
+
+
+def _stdout_color_enabled() -> bool:
+    """Return True when we may emit ANSI colour to stdout."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+class _C:
+    """ANSI colour codes (no-op placeholders when colour is disabled)."""
+
+    def __init__(self, enabled: bool) -> None:
+        if enabled:
+            self.reset = "\033[0m"
+            self.bold = "\033[1m"
+            self.dim = "\033[2m"
+            self.red = "\033[31m"
+            self.green = "\033[32m"
+            self.yellow = "\033[33m"
+            self.cyan = "\033[36m"
+        else:
+            self.reset = ""
+            self.bold = ""
+            self.dim = ""
+            self.red = ""
+            self.green = ""
+            self.yellow = ""
+            self.cyan = ""
+
+
+def _paint(c: _C, code: str, text: str) -> str:
+    """Wrap *text* in a colour code (no-op when the code is empty)."""
+    return f"{code}{text}{c.reset}" if code else text
+
+
+def render_report(outcome, *, color: bool = False) -> str:
+    c = _C(color)
     lines = []
     for provider in outcome.providers:
         status = "changes" if provider.changed else "unchanged"
-        lines.append(f"[{status}] {provider.name}")
+        status_color = c.green if provider.changed else c.dim
+        lines.append(
+            f"{_paint(c, status_color, '[' + status + ']')} "
+            f"{_paint(c, c.bold, provider.name)}"
+        )
         if provider.added:
-            lines.append(f"    added   ({len(provider.added)}): " + ", ".join(provider.added))
+            lines.append(
+                f"{_paint(c, c.green, '    added   ')}({len(provider.added)}): "
+                + ", ".join(provider.added)
+            )
         if provider.removed:
-            lines.append(f"    removed ({len(provider.removed)}): " + ", ".join(provider.removed))
+            lines.append(
+                f"{_paint(c, c.red, '    removed ')}({len(provider.removed)}): "
+                + ", ".join(provider.removed)
+            )
         if provider.settings_keys_removed:
             lines.append(
                 "    settings keys removed ({}): {}".format(
@@ -160,25 +220,35 @@ def render_report(outcome) -> str:
                 )
             )
         if provider.kept:
-            lines.append(f"    kept    ({provider.kept}) with existing metadata")
+            lines.append(
+                f"{_paint(c, c.dim, '    kept    ')}({provider.kept}) "
+                "with existing metadata"
+            )
         if provider.credits is not None:
-            lines.append(f"    credits: {provider.credits}")
+            lines.append(
+                f"{_paint(c, c.cyan, '    credits: ')}{provider.credits}"
+            )
         if provider.skipped_deletion:
-            lines.append("    deletion skipped: keeping existing models")
+            lines.append(_paint(c, c.yellow, "    deletion skipped: keeping existing models"))
         if provider.discarded_invalid:
             lines.append(
-                "    discarded invalid entries ({}) — missing or non-string 'id': {}".format(
+                f"{_paint(c, c.yellow, '    discarded invalid entries')} "
+                "({}) — missing or non-string 'id': {}".format(
                     len(provider.discarded_invalid),
                     ", ".join(repr(e) for e in provider.discarded_invalid),
                 )
             )
         if provider.no_endpoints:
             lines.append(
-                "    warning: no endpoint url — nothing to fetch, add a "
-                "'url' to at least one model"
+                _paint(
+                    c,
+                    c.yellow,
+                    "    warning: no endpoint url — nothing to fetch, add a "
+                    "'url' to at least one model",
+                )
             )
         for error in provider.errors:
-            lines.append(f"    error: {error}")
+            lines.append(f"    {_paint(c, c.red, 'error:')} {error}")
     return "\n".join(lines)
 
 
@@ -219,7 +289,12 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     total = len(outcome.providers)
     failed = [p for p in outcome.providers if not p.ok]
     changed = [p for p in outcome.providers if p.changed]
-    report = render_report(outcome) if total else ""
+    # Human-facing stdout is coloured on an interactive TTY; a plain copy is
+    # always kept for the machine-readable stderr stream.
+    stdout_color = _stdout_color_enabled()
+    report = render_report(outcome, color=stdout_color) if total else ""
+    plain_report = render_report(outcome) if total else ""
+    _c = _C(stdout_color)
 
     if args.dry_run:
         print("Dry run - no files were written.")
@@ -236,13 +311,14 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             print(report)
 
     print(
-        f"\nSummary: {total} provider(s) targeted, "
+        f"\n{_paint(_c, _c.bold, 'Summary:')} {total} provider(s) targeted, "
         f"{len(changed)} changed, {len(failed)} with errors."
     )
 
-    # Scripts/CI read stderr; keep the human report on stdout as well.
-    if failed and report:
-        print(report, file=sys.stderr)
+    # Scripts/CI read stderr; keep the human report on stderr as well, but
+    # always uncoloured so it stays safe to grep / redirect.
+    if failed and plain_report:
+        print(plain_report, file=sys.stderr)
 
     return EXIT_PARTIAL_FAILURE if failed else EXIT_OK
 
