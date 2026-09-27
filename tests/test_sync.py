@@ -480,6 +480,120 @@ class SyncTest(unittest.TestCase):
         )
         self.assertTrue(outcome.providers[0].errors)
 
+    def test_cross_provider_settings_pruned_when_model_removed(self):
+        """A non-customendpoint provider that references a removed model via a
+        three-segment settings key must have that key pruned; its own
+        ``models`` list and unrelated settings keys are left untouched."""
+        source = provider(
+            name="Agnes",
+            models=[{"id": "m1", "name": "M1", "url": "https://x.test"}],
+        )
+        other = {
+            "name": "Copilot",
+            "vendor": "agent-host-copilotcli",
+            "models": [{"id": "x", "name": "X", "url": "https://a.test"}],
+            "settings": {
+                "customendpoint/Agnes/m1": {"thinkingLevel": "max"},
+                "auto": {"tier": "x"},
+            },
+        }
+        # Remote succeeds but only advertises m2, so m1 is genuinely removed
+        # (an empty data list would be a failed fetch, not a deletion).
+        route = {"https://x.test/v1/models": body("m2")}
+        outcome = sync_config([source, other], lambda n, u: _fetch(n, u, route))
+
+        self.assertEqual(["m1"], outcome.providers[0].removed)
+        # The cross-provider reference is pruned; the unrelated key survives.
+        self.assertEqual({"auto": {"tier": "x"}}, outcome.config[1]["settings"])
+        self.assertEqual(["customendpoint/Agnes/m1"],
+                         outcome.providers[0].cross_settings_removed)
+        # The other provider's own models list is never touched.
+        self.assertEqual([{"id": "x", "name": "X", "url": "https://a.test"}],
+                         outcome.config[1]["models"])
+
+    def test_cross_provider_settings_not_pruned_with_no_delete(self):
+        """With --no-delete the model is kept, so nothing is removed and the
+        cross-provider settings reference must survive untouched."""
+        source = provider(
+            name="Agnes",
+            models=[{"id": "m1", "name": "M1", "url": "https://x.test"}],
+        )
+        other = {
+            "name": "Copilot",
+            "vendor": "agent-host-copilotcli",
+            "settings": {"customendpoint/Agnes/m1": {"thinkingLevel": "max"}},
+        }
+        route = {"https://x.test/v1/models": body("m2")}
+        outcome = sync_config(
+            [source, other],
+            lambda n, u: _fetch(n, u, route),
+            allow_delete=False,
+        )
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertEqual([], outcome.providers[0].cross_settings_removed)
+        self.assertEqual(
+            {"customendpoint/Agnes/m1": {"thinkingLevel": "max"}},
+            outcome.config[1]["settings"],
+        )
+
+    def test_cross_provider_settings_pruned_for_slashed_model_id(self):
+        """A model id containing '/' must still match exactly, because the
+        qualified key is built by f-string concatenation and compared by full
+        equality (never split on '/').  Pins the 'exact concatenation'
+        assumption documented in prune_cross_settings."""
+        model_id = "nvidia/nemotron-3-ultra-550b-a55b"
+        cross_key = "customendpoint/NvidiaProvider/" + model_id
+        source = provider(
+            name="NvidiaProvider",
+            models=[{"id": model_id, "name": "Nemotron", "url": "https://x.test"}],
+        )
+        other = {
+            "name": "Copilot",
+            "vendor": "agent-host-copilotcli",
+            "settings": {cross_key: {"thinkingLevel": "max"}},
+        }
+        # Remote succeeds with a different model, so the slashed id is removed.
+        route = {"https://x.test/v1/models": body("m2")}
+        outcome = sync_config([source, other], lambda n, u: _fetch(n, u, route))
+        self.assertEqual([model_id], outcome.providers[0].removed)
+        self.assertNotIn("settings", outcome.config[1])
+        self.assertEqual([cross_key],
+                         outcome.providers[0].cross_settings_removed)
+
+    def test_cross_provider_settings_idempotent(self):
+        """After the cross-provider reference is pruned on the first pass, a
+        second run over the result is a no-op: nothing is removed and the
+        config is reported unchanged."""
+        source = provider(
+            name="Agnes",
+            models=[{"id": "m1", "name": "M1", "url": "https://x.test"}],
+        )
+        other = {
+            "name": "Copilot",
+            "vendor": "agent-host-copilotcli",
+            "settings": {"customendpoint/Agnes/m1": {"thinkingLevel": "max"}},
+        }
+        # Fixed route: the remote succeeds but only advertises m2 on both
+        # runs, so m1 is removed on the first and is NOT re-added on the
+        # second.  Reusing this same fetcher is deliberate: if the second
+        # run re-advertised m1, the added model would flip `changed` to True
+        # and the no-op assertion below would falsely fail.
+        route = {"https://x.test/v1/models": body("m2")}
+        fetcher = lambda n, u: _fetch(n, u, route)
+
+        o1 = sync_config([source, other], fetcher)
+        self.assertEqual(["customendpoint/Agnes/m1"],
+                         o1.providers[0].cross_settings_removed)
+        self.assertNotIn("settings", o1.config[1])
+
+        # Second pass reuses the SAME fetcher (still no m1), so the only thing
+        # that could change is a re-adding of m1, which the assertions below
+        # rule out.
+        o2 = sync_config(o1.config, fetcher)
+        self.assertFalse(o2.changed, "second run must be a no-op")
+        self.assertEqual([], o2.providers[0].removed)
+        self.assertEqual([], o2.providers[0].cross_settings_removed)
+
     def test_partial_multi_url_failure_skips_deletion(self):
         cfg = [
             provider(

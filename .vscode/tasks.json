@@ -29,7 +29,8 @@
 			"presentation": {
 				"reveal": "silent",
 				"close": true
-			}
+			},
+            "problemMatcher": []
 		}
 	]
 }

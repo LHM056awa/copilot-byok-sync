@@ -47,6 +47,12 @@ class ProviderSyncResult:
     # silently.  Does not count against `ok` (it is a config issue, not a
     # request failure) and does not affect the delete guard.
     no_endpoints: bool = False
+    # Cross-provider settings keys (any vendor) that referenced one of this
+    # provider's removed model ids, e.g. "customendpoint/<name>/<id>", and
+    # were pruned from other providers.  Populated by
+    # sync.prune_cross_settings; display-only, does not affect ok or the
+    # delete guard.
+    cross_settings_removed: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

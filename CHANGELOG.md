@@ -4,6 +4,14 @@ All notable changes to `clm-sync` are documented in this file.
 
 ---
 
+## 0.5.1 (2026-09-27)
+
+### Fixed
+
+- **跨 provider settings 残留清理**：同步删除某 customendpoint 模型时，其他 vendor（如 `agent-host-copilotcli`）`settings` 里以 `<vendor>/<provider>/<model_id>` 形式引用该模型的条目此前无人清理，导致模型已删但配置残留。新增 `prune_cross_settings` 在 `sync_config` 末尾对整个配置做第二遍剪枝，删除任意 provider `settings` 中精确匹配 `customendpoint/<name>/<id>` 的 key（只碰 `settings`，绝不动其他 vendor 的 `models` 与受保护字段，且幂等）；报告在源 provider 下打印 `cross-provider settings removed` 行。
+
+---
+
 ## 0.5.0 (2026-09-27)
 
 ### Added

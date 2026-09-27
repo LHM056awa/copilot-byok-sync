@@ -219,6 +219,14 @@ def render_report(outcome, *, color: bool = False) -> str:
                     ", ".join(provider.settings_keys_removed),
                 )
             )
+        if provider.cross_settings_removed:
+            lines.append(
+                f"{_paint(c, c.yellow, '    cross-provider settings removed')} "
+                "({}): {}".format(
+                    len(provider.cross_settings_removed),
+                    ", ".join(provider.cross_settings_removed),
+                )
+            )
         if provider.kept:
             lines.append(
                 f"{_paint(c, c.dim, '    kept    ')}({provider.kept}) "

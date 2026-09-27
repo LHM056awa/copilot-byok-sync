@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import (
+    CUSTOM_ENDPOINT_VENDOR,
     FetchResult,
     ModelSyncError,
     ProviderSyncResult,
@@ -315,6 +316,76 @@ def apply_provider_sync(
     return result
 
 
+def prune_cross_settings(
+    config: List[Dict[str, Any]],
+    provider_results: List[ProviderSyncResult],
+    vendor: str = CUSTOM_ENDPOINT_VENDOR,
+) -> None:
+    """Prune ``settings`` keys in ALL providers that reference a removed model.
+
+    Beyond the source provider's own model list, other providers (any vendor)
+    may keep configuration for that model under a cross-provider settings key
+    such as ``customendpoint/AgnesAICN/agnes-3.0-flash``.  This pass drops any
+    settings key that points at a model id just removed from a customendpoint
+    provider, across the whole config.
+
+    Matching assumption:
+      This function assumes the external tool that writes cross-provider
+      settings keys (the Copilot SDK) composes them with plain f-string
+      concatenation ``f"{vendor}/{provider_name}/{model_id}"``.  The match is
+      done by *full key equality* against that exact string, not by splitting
+      on ``/`` and re-joining, so a model_id that itself contains ``/`` (e.g.
+      ``nvidia/nemotron-3-ultra-550b-a55b``) is still matched correctly.  If
+      that tool ever switches to URL-encoding or another delimiter convention,
+      this match will silently stop working and the concatenation rule here
+      must be updated to follow.
+
+    Ownership of the removed keys in the report:
+      ``owner_of`` is a single-value dict: if ``--all`` contains two source
+      providers with the same name and they remove the same model_id, they
+      produce the same qualified key, which is pruned once.  The attribution
+      of that key in the report falls to the *last* result in traversal
+      order.  The pruning itself is correct either way (the key is dropped
+      exactly once); only the report attribution is slightly skewed in that
+      rare edge case.  This is a deliberate trade-off: we do not add the
+      complexity of attributing one key to multiple results for an uncommon
+      corner case.
+
+    Idempotent: a second run over already-pruned config finds nothing to
+    remove and makes no change.  Only the ``settings`` dict of each provider
+    is touched; ``models`` and all protected fields are never modified.
+    """
+    qualified: set[str] = set()
+    owner_of: Dict[str, ProviderSyncResult] = {}
+    for result in provider_results:
+        if not result.removed:
+            continue
+        for model_id in result.removed:
+            key = f"{vendor}/{result.name}/{model_id}"
+            qualified.add(key)
+            owner_of[key] = result
+
+    if not qualified:
+        return
+
+    for prov in config:
+        settings = prov.get("settings")
+        if not isinstance(settings, dict):
+            continue
+        to_drop = [k for k in settings if k in qualified]
+        if not to_drop:
+            continue
+        pruned = {k: v for k, v in settings.items() if k not in qualified}
+        if pruned:
+            prov["settings"] = pruned
+        else:
+            del prov["settings"]
+        for k in to_drop:
+            owner = owner_of.get(k)
+            if owner is not None:
+                owner.cross_settings_removed.append(k)
+
+
 def _select_positions(
     config: List[Dict[str, Any]],
     provider_names: Optional[Sequence[str]],
@@ -449,6 +520,12 @@ def sync_config(
         # instead of relying on list ordering.
         result.config_index = config_index
         provider_results.append(result)
+
+    # Second pass: drop cross-provider settings keys that still point at a
+    # model id just removed from a customendpoint provider.  Runs on the whole
+    # post-sync config; only touches `settings`, never `models` or protected
+    # fields.  Idempotent.
+    prune_cross_settings(working, provider_results)
 
     changed = working != config
     return SyncOutcome(config=working, changed=changed, providers=provider_results)

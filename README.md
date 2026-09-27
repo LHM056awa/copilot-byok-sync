@@ -60,7 +60,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ## API key 自动解析
 
-当 provider 的 `apiKey` 字段是形如 `${input:chat.lm.secret.<id>}` 的 VS Code Secret Storage 占位符时，工具会自动解析出真实 key 并随请求发送（`Authorization: Bearer <key>`），整个过程无需手动管理密钥。
+当 provider 的 `apiKey` 字段是形如 `${input:chat.lm.secret.<id>}` 的 VS Code Secret Storage 占位符时，工具会自动解析出真实 key 并随请求发送（`Authorization: Bearer <key>`）。
 
 **解析链路：**
 
@@ -84,14 +84,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ## 余额查询
 
-一次同步运行结束后（含 `--dry-run`），未指定 `--no-credits` 时，工具会自动查询 base URL 属于**已知厂商端点**的 provider 的账户余额，并在报告里对应 provider 下追加一行 `credits:`（示例值）：
-
-```
-[changes] DeepSeek
-    credits: 12.34 CNY
-```
-
-匹配依据是 URL 的**域名**，与你在配置里写的 provider 名无关。当前已知端点：
+匹配依据是 URL 的**域名**，与配置里写的 provider 名无关。当前已知端点：
 
 | 域名 | 余额端点 | 货币 |
 | - | - | - |
@@ -125,7 +118,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ## 删除规则
 
-默认情况下，工具会删除本地存在但远端 `/v1/models` 已不再返回的模型。删除同时会移除该模型在 provider 顶层 `settings` 中对应的配置项。
+默认情况下，工具会删除本地存在但远端 `/v1/models` 已不再返回的模型。删除同时会移除该模型在 provider 顶层 `settings` 中对应的配置项。**此外**，其他 vendor（如 `agent-host-copilotcli`）的 `settings` 里若以 `<vendor>/<provider名>/<模型id>` 形式引用了被删模型（如 `customendpoint/AgnesAICN/agnes-3.0-flash`），该跨 provider 引用也会被顺带清理。
 
 为避免网络故障导致误删，只有在以下条件全部满足时才会执行删除：
 
@@ -137,7 +130,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 **顺序语义。** 默认**保留你手排的模型顺序**，新模型**追加到列表末尾**；没有实质变更的同步不会重写文件。加 `--sort` 参数可顺带把每个端点的模型列表按 id 字典序升序（大小写敏感，`Z` 排在 `a` 前）重排——首次排序会重写一次，此后顺序已稳定，再跑 `--sort` 即 no-op。
 
-**本地重复 id。** 同一个 id 在本地出现多条时，`--no-delete` 下**全部保留**（不静默去重丢失数据）；允许删除且远端已不下发该 id 时，所有重复条目会**一并删除**（只报告一次）。
+**本地重复 id。** 同一个 id 在本地出现多条时，`--no-delete` 下**全部保留**；允许删除且远端已不下发该 id 时，所有重复条目会**一并删除**。
 
 ## 安全性说明
 
@@ -204,7 +197,8 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
       "presentation": {
         "reveal": "silent",
         "close": true
-      }
+      },
+      "problemMatcher": []
     }
   ]
 }
@@ -213,7 +207,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 **任务说明：**
 
 - `Sync Custom Endpoints`：在 VS Code 集成终端里同步全局配置。
-- `Sync Custom Endpoints in WT`：通过 `wt`（Windows Terminal）弹出一个新窗口运行同步，报告直接显示在窗口里（交互终端下自动着色，见「报告着色」），结尾 `pause` 停住便于查看。
+- `Sync Custom Endpoints in WT`：通过 `wt`（Windows Terminal）弹出一个新窗口运行同步，报告直接显示在窗口里。
 
 **双击运行的批处理脚本。** 仓库根目录还提供：
 
