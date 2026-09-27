@@ -42,6 +42,11 @@ class ProviderSyncResult:
     # list.  Populated by sync_config; lets a consumer pair a result back to
     # its exact provider by index rather than relying on list-ordering.
     config_index: Optional[int] = None
+    # Set when the provider declares no requestable endpoint url, so it could
+    # not be synced at all.  Surfaced in the report instead of failing
+    # silently.  Does not count against `ok` (it is a config issue, not a
+    # request failure) and does not affect the delete guard.
+    no_endpoints: bool = False
 
     @property
     def ok(self) -> bool:
@@ -83,7 +88,8 @@ def base_display_name(model_id: str) -> str:
     becomes "Deepseek V4 Flash" rather than "Deepseek Ai / Deepseek V4 Flash".
     """
     last_segment = model_id.rsplit("/", 1)[-1]
-    for ch in ("-", "_", ".", ":"):
+    # "." is not a separator so versions/dates keep their dots (2.0, v4.5, 2024.08.06).
+    for ch in ("-", "_", ":"):
         last_segment = last_segment.replace(ch, " ")
     words = [w for w in last_segment.split() if w]
     titled = [_smart_title(w) for w in words]

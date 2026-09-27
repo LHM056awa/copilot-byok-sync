@@ -172,6 +172,11 @@ def render_report(outcome) -> str:
                     ", ".join(repr(e) for e in provider.discarded_invalid),
                 )
             )
+        if provider.no_endpoints:
+            lines.append(
+                "    warning: no endpoint url — nothing to fetch, add a "
+                "'url' to at least one model"
+            )
         for error in provider.errors:
             lines.append(f"    error: {error}")
     return "\n".join(lines)

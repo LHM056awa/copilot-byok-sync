@@ -200,6 +200,22 @@ class DisplayNameTest(unittest.TestCase):
     def test_version_tokens_uppercased(self):
         self.assertEqual("Qwen3 8B", base_display_name("Qwen3-8B"))
 
+    def test_dot_preserved_in_version_and_date_tokens(self):
+        self.assertEqual("Agnes 2.0 Flash", base_display_name("agnes-2.0-flash"))
+        self.assertEqual("QWEN3.5 72b", base_display_name("qwen3.5-72b"))
+        self.assertEqual("V4.5", base_display_name("v4.5"))
+        self.assertEqual("Glm 4.6", base_display_name("glm-4.6"))
+        self.assertEqual(
+            "Model 2024.08.06", base_display_name("model-2024.08.06")
+        )
+
+    def test_dot_in_prefix_and_plain_dotted_word(self):
+        self.assertEqual(
+            "Inner Segment",
+            base_display_name("something.with.dots/inner-segment"),
+        )
+        self.assertEqual("Foo.bar.baz", base_display_name("foo.bar.baz"))
+
 
 class SyncTest(unittest.TestCase):
     def test_new_model_keeps_remote_metadata(self):
@@ -235,6 +251,112 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("object", added)
         self.assertNotIn("created", added)
         self.assertNotIn("owned_by", added)
+
+    def test_new_model_keys_ordered_id_first_with_remote_name(self):
+        model_id = "nvidia/nemotron-3-ultra-550b-a55b"
+        payload = json.dumps(
+            {
+                "data": [
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": 735790403,
+                        "owned_by": "nvidia",
+                        "name": "Nemotron 3 Ultra 550B",
+                        "toolCalling": True,
+                        "vision": True,
+                        "maxInputTokens": 262144,
+                        "maxOutputTokens": 65536,
+                    }
+                ]
+            }
+        )
+        cfg = [provider(models=[{"id": "old", "name": "Old", "url": "https://x.test"}])]
+        outcome = sync_config(
+            cfg,
+            lambda n, u: _fetch(n, u, {"https://x.test/v1/models": payload}),
+        )
+        added = next(
+            model for model in outcome.config[0]["models"] if model["id"] == model_id
+        )
+        self.assertEqual(
+            [
+                "id",
+                "name",
+                "url",
+                "toolCalling",
+                "vision",
+                "maxInputTokens",
+                "maxOutputTokens",
+                "supportsReasoningEffort",
+            ],
+            list(added.keys()),
+        )
+
+    def test_new_model_keys_ordered_id_first_without_remote_name(self):
+        cfg = [provider(models=[{"id": "old", "name": "Old", "url": "https://x.test"}])]
+        route = {"https://x.test/v1/models": body("old", "new-model")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        added = next(
+            model
+            for model in outcome.config[0]["models"]
+            if model["id"] == "new-model"
+        )
+        self.assertEqual(
+            [
+                "id",
+                "name",
+                "url",
+                "toolCalling",
+                "vision",
+                "maxInputTokens",
+                "maxOutputTokens",
+                "supportsReasoningEffort",
+            ],
+            list(added.keys()),
+        )
+
+    def test_existing_model_key_order_preserved(self):
+        seed = {"name": "Old", "id": "old", "url": "https://x.test"}
+        cfg = [provider(models=[copy.deepcopy(seed)])]
+        route = {"https://x.test/v1/models": body("old")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        kept = outcome.config[0]["models"][0]
+        self.assertEqual(["name", "id", "url"], list(kept.keys()))
+
+    def test_new_model_without_remote_name_uses_dot_preserving_fallback(self):
+        cfg = [provider(models=[{"id": "old", "name": "Old", "url": "https://x.test"}])]
+        route = {"https://x.test/v1/models": body("old", "agnes-2.0-flash")}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        added = next(
+            model
+            for model in outcome.config[0]["models"]
+            if model["id"] == "agnes-2.0-flash"
+        )
+        self.assertEqual("Agnes 2.0 Flash", added["name"])
+
+    def test_new_model_with_dotted_remote_name_is_kept_verbatim(self):
+        payload = json.dumps(
+            {
+                "data": [
+                    {
+                        "id": "agnes-2.0-flash",
+                        "name": "Agnes 2.0 Flash",
+                    }
+                ]
+            }
+        )
+        cfg = [provider(models=[{"id": "old", "name": "Old", "url": "https://x.test"}])]
+        outcome = sync_config(
+            cfg,
+            lambda n, u: _fetch(n, u, {"https://x.test/v1/models": payload}),
+        )
+        added = next(
+            model
+            for model in outcome.config[0]["models"]
+            if model["id"] == "agnes-2.0-flash"
+        )
+        self.assertEqual("Agnes 2.0 Flash", added["name"])
 
     def test_adds_new_models_with_minimal_object(self):
         cfg = [
@@ -662,6 +784,32 @@ class SyncTest(unittest.TestCase):
         outcome = sync_config([empty], lambda n, u: FetchResult(u, n, True, ["x"]))
         self.assertFalse(outcome.changed)
         self.assertNotIn("models", outcome.config[0])
+
+    def test_url_only_pointer_survives_failed_fetch(self):
+        """A provider whose only model entry is a url-only pointer (no id): when
+        the fetch fails, the pointer must be re-added so a later run can still
+        reach the endpoint, instead of being discarded as an invalid entry and
+        losing the endpoint forever.  The failed fetch is still reported."""
+        cfg = [provider(models=[{"url": "https://x.test"}])]
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, {}))  # no fixture -> 404
+        # The url-only entry was discarded as invalid...
+        self.assertEqual([{"url": "https://x.test"}], outcome.providers[0].discarded_invalid)
+        # ...but the endpoint pointer is re-added so it stays resync-able.
+        self.assertEqual([{"url": "https://x.test"}], outcome.config[0]["models"])
+        self.assertFalse(outcome.changed, "pointer re-added identically -> no rewrite")
+        self.assertTrue(outcome.providers[0].errors, "the failed fetch must be reported")
+
+    def test_provider_without_any_endpoint_is_flagged(self):
+        """A customendpoint that declares no models and no url must be surfaced
+        via the no_endpoints flag (a warning in the report) instead of silently
+        doing nothing.  It does not count as an error, and no `models` key is
+        fabricated on it."""
+        cfg = [{"name": "NoEp", "vendor": "customendpoint", "apiType": "chat-completions"}]
+        outcome = sync_config(cfg, lambda n, u: FetchResult(u, n, True, []))
+        self.assertTrue(outcome.providers[0].no_endpoints)
+        self.assertTrue(outcome.providers[0].ok, "no request was made, so no error")
+        self.assertNotIn("models", outcome.config[0])
+        self.assertFalse(outcome.changed)
 
     def test_three_arg_fetcher_receives_resolved_key(self):
         """A fetcher accepting three positional args must be called with the

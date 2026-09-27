@@ -43,6 +43,12 @@ MODEL_CONFIG_FIELDS = (
     "modelOptions",
 )
 
+# Canonical on-disk key order for newly created model entries: id first,
+# then the MODEL_CONFIG_FIELDS order. Only decides key order, never values;
+# existing entries are deep-copied untouched. Keep in sync with
+# MODEL_CONFIG_FIELDS when fields are added.
+_CANONICAL_MODEL_KEY_ORDER = ("id",) + MODEL_CONFIG_FIELDS
+
 DEFAULT_NEW_MODEL_FIELDS = {
     "toolCalling": True,
     "vision": True,
@@ -211,6 +217,7 @@ def merge_provider_models(
             model.setdefault("url", base_url)
             for key, value in DEFAULT_NEW_MODEL_FIELDS.items():
                 model.setdefault(key, copy.deepcopy(value))
+            model = {k: model[k] for k in _CANONICAL_MODEL_KEY_ORDER if k in model}
             ordered.append(model)
             surviving_ids.add(model_id)
 
@@ -267,6 +274,20 @@ def apply_provider_sync(
         if not res.success:
             message = res.error or "request failed"
             result.errors.append(f"{res.base_url}: {message}")
+
+    # Endpoint bookkeeping -- keep two failure modes from being silent:
+    #   * no requestable endpoint url at all -> flag it so the report explains
+    #     why nothing could be fetched (a config issue, not a request failure).
+    #   * endpoint url(s) exist but the merge left the list empty (e.g. the
+    #     provider carried only url-only pointer entries and the request
+    #     failed, so the pointers would otherwise be discarded as invalid and
+    #     the endpoint lost forever) -> keep one `{"url": ...}` per endpoint
+    #     as a resync hook so a later run can still fetch from it.
+    local_urls = endpoint_base_urls(provider.get("models"))
+    if not local_urls:
+        result.no_endpoints = True
+    elif not new_models:
+        new_models = [{"url": u} for u in local_urls]
 
     changed = False
     has_models_key = "models" in provider

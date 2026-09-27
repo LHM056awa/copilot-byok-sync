@@ -4,6 +4,22 @@ All notable changes to `clm-sync` are documented in this file.
 
 ---
 
+## 0.4.0 (2026-09-27)
+
+### Fixed
+
+- **`base_display_name` 保留版本号/日期中的点**：`.` 不再当作单词分隔符，`agnes-2.0-flash` 渲染为 `Agnes 2.0 Flash`（此前被拆成 `Agnes 2 0 Flash`）；`2024.08.06`、`v4.5` 等日期/版本 token 同理。
+
+### Changed
+
+- **新加入模型条目的字段顺序固定**：新条目统一按 `id → name → url → toolCalling → vision → maxInputTokens → maxOutputTokens → supportsReasoningEffort` 写盘（`id` 恒在前），不再随远端是否返回 `name` 而变化；已存在条目仍原样保留不受影响。
+
+### Added
+
+- **无端点 provider 告警 + 端点指针保留**：`models` 里没有任何可请求 `url` 的 provider 不再被静默忽略，报告打印 `warning: no endpoint url ...`（配置提示，不影响退出码与删除保护）；url-only 指针条目在请求失败时保留为 resync hook，避免端点信息永久丢失。
+
+---
+
 ## 0.3.0 (2026-09-27)
 
 ### Added
