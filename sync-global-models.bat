@@ -11,6 +11,8 @@ rem
 rem  Double-click to run, or:  sync-global-models.bat
 rem ============================================================
 setlocal
+set "ROOT=%~dp0"
+set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
 set "CONFIG=%APPDATA%\Code\User\chatLanguageModels.json"
 
 echo === clm-sync: global model list ===

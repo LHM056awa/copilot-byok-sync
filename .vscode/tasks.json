@@ -11,6 +11,11 @@
 				"${env:APPDATA}/Code/User/chatLanguageModels.json",
 				"--all"
 			],
+			"options": {
+				"env": {
+					"PYTHONPATH": "${workspaceFolder}/src"
+				}
+			},
 			"group": {
 				"kind": "build",
 				"isDefault": true
@@ -24,7 +29,7 @@
 				"0",
 				"cmd",
 				"/c",
-				"python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
+				"set PYTHONPATH=${workspaceFolder}\\src& python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
 			],
 			"presentation": {
 				"reveal": "silent",

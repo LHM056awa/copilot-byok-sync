@@ -15,6 +15,7 @@ import urllib.request
 from typing import Any, Callable, Dict, Optional, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
+from . import __version__
 from .models import FetchResult, normalize_id
 
 LOGGER = logging.getLogger(__name__)
@@ -153,7 +154,7 @@ def default_transport(
     """
     request = urllib.request.Request(url, method="GET")
     request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "clm-sync/0.5.1")
+    request.add_header("User-Agent", f"clm-sync/{__version__}")
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")
     try:

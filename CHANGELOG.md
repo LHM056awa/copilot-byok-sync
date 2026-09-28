@@ -4,6 +4,14 @@ All notable changes to `clm-sync` are documented in this file.
 
 ---
 
+## 0.5.2 (2026-09-28)
+
+### Fixed
+
+- **免安装运行找不到模块**：`src` 布局下未执行 `pip install -e .` 时，`python -m clm_sync.cli` 报 `ModuleNotFoundError: No module named 'clm_sync'`。`sync-global-models.bat` 与 `.vscode/tasks.json` 两个任务现默认把 `src` 加入 `PYTHONPATH`，双击 / 任务直跑即可；`client.py` 的 `User-Agent` 硬编码版本号改为跟随 `__version__`，避免下次发版遗漏。
+
+---
+
 ## 0.5.1 (2026-09-27)
 
 ### Fixed
