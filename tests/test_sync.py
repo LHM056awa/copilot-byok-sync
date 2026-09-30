@@ -6,6 +6,7 @@ import copy
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -1482,6 +1483,72 @@ class CreditsTest(unittest.TestCase):
         by_index = {r.config_index: r for r in outcome.providers}
         self.assertEqual("deepseek", by_index[0].credits)
         self.assertEqual("moonshot", by_index[1].credits)
+
+
+class ColoringTest(unittest.TestCase):
+    """Decision matrix for _stdout_color_enabled / _windows_vt100_ready.
+
+    Patches the individual signals (os.name, isatty, NO_COLOR, the VT100
+    probe) so each branch is exercised deterministically, without needing a
+    real console handle."""
+
+    def test_no_color_env_disables_color(self):
+        with patch.dict(os.environ, {"NO_COLOR": "1"}), patch.object(
+            sys.stdout, "isatty", return_value=True
+        ), patch("clm_sync.cli.os.name", "nt"):
+            self.assertFalse(cli._stdout_color_enabled())
+
+    def test_non_tty_stdout_is_plain(self):
+        with patch.object(sys.stdout, "isatty", return_value=False), patch(
+            "clm_sync.cli.os.name", "nt"
+        ), patch.dict(os.environ, {}):
+            self.assertFalse(cli._stdout_color_enabled())
+
+    def test_non_windows_tty_stays_coloured(self):
+        # Non-Windows keeps the pre-existing behaviour: TTY -> colour, with
+        # no VT probe involved at all.
+        with patch.object(sys.stdout, "isatty", return_value=True), patch(
+            "clm_sync.cli.os.name", "posix"
+        ), patch("clm_sync.cli._windows_vt100_ready") as probe, patch.dict(
+            os.environ, {}
+        ):
+            self.assertTrue(cli._stdout_color_enabled())
+            probe.assert_not_called(), "non-Windows must not run the VT probe"
+
+    def test_windows_tty_with_vt_ready_is_coloured(self):
+        with patch.object(sys.stdout, "isatty", return_value=True), patch(
+            "clm_sync.cli.os.name", "nt"
+        ), patch("clm_sync.cli._windows_vt100_ready", return_value=True) as probe, patch.dict(
+            os.environ, {}
+        ):
+            self.assertTrue(cli._stdout_color_enabled())
+            probe.assert_called_once()
+
+    def test_windows_tty_without_vt_falls_back_to_plain(self):
+        # The original bug: a real conhost with VT off must NOT dump raw
+        # escape codes.  Probe returns False -> no colour.
+        with patch.object(sys.stdout, "isatty", return_value=True), patch(
+            "clm_sync.cli.os.name", "nt"
+        ), patch("clm_sync.cli._windows_vt100_ready", return_value=False), patch.dict(
+            os.environ, {}
+        ):
+            self.assertFalse(cli._stdout_color_enabled())
+
+    def test_windows_non_real_console_is_trusted_to_render(self):
+        # A non-conhost handle (GetConsoleMode fails, e.g. VS Code integrated
+        # terminal) is trusted to render ANSI, so colour stays on.
+        self.assertTrue(cli._windows_vt100_ready())
+
+    def test_render_report_toggles_ansi_by_color_flag(self):
+        # Locks the render layer: color=True injects ANSI escapes, color=False
+        # (the stderr/plain copy) emits none.
+        from clm_sync.models import ProviderSyncResult
+
+        outcome = type(
+            "O", (), {"providers": [ProviderSyncResult(name="P", changed=True, added=["a"])]}
+        )()
+        self.assertIn("\x1b[", cli.render_report(outcome, color=True))
+        self.assertNotIn("\x1b[", cli.render_report(outcome, color=False))
 
 
 class CliTest(unittest.TestCase):

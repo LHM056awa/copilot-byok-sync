@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 from typing import Optional, Sequence
@@ -155,14 +156,80 @@ def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
 # ---------------------------------------------------------------------------
 
 
+def _windows_vt100_ready() -> bool:
+    """Best-effort check that stdout's console can render ANSI (VT100) codes.
+
+    Windows-only; every other platform returns True, leaving the pre-existing
+    (Linux/macOS/WSL) behaviour completely untouched.
+
+    On Windows:
+      * A *real* conhost console is probed with GetConsoleMode:
+          - the ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004) bit is already on
+            -> True;
+          - it is off -> we call SetConsoleMode to turn it on; True on
+            success, False on failure (a very old OS that cannot do VT).
+            This is what lets plain ``cmd.exe`` / PowerShell render colour
+            instead of dumping raw escape codes.
+      * A *non-real* console handle (GetConsoleMode fails) is an
+        ANSI-emulating pty -- e.g. the VS Code integrated terminal or xterm --
+        which already renders ANSI, so we return True to keep its current
+        coloured behaviour.
+      * Any ctypes problem degrades to False (no colour, never crashes the
+        run), mirroring the defensive style used by ``secrets.py``.
+    """
+    if os.name != "nt":
+        return True
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return False
+    try:
+        # ctypes.wintypes is a Windows-only module; import it lazily so the
+        # top-level module import stays portable to Linux/macOS.
+        import ctypes.wintypes as wt
+    except Exception:
+        return False
+    try:
+        kernel32 = windll.kernel32
+        kernel32.GetStdHandle.argtypes = [wt.DWORD]
+        kernel32.GetStdHandle.restype = wt.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+        kernel32.GetConsoleMode.restype = wt.BOOL
+        kernel32.SetConsoleMode.argtypes = [wt.HANDLE, wt.DWORD]
+        kernel32.SetConsoleMode.restype = wt.BOOL
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = wt.DWORD(0)
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            # Not a real conhost handle -> an emulated terminal that renders
+            # ANSI natively (VS Code integrated terminal, xterm, ...).
+            return True
+        _ENABLE_VT = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if mode.value & _ENABLE_VT:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | _ENABLE_VT))
+    except Exception:
+        return False
+
+
 def _stdout_color_enabled() -> bool:
-    """Return True when we may emit ANSI colour to stdout."""
+    """Return True when we may emit ANSI colour to stdout.
+
+    Colour is allowed only when stdout is an interactive terminal *and* that
+    terminal can actually render ANSI: on Windows a real console must have
+    virtual-terminal (VT100) processing available (enabled here if possible),
+    and an emulated / ANSI-native terminal (e.g. the VS Code integrated
+    terminal) is trusted to render it.  Piped or redirected stdout, and the
+    NO_COLOR convention, stay plain text.
+    """
     if os.environ.get("NO_COLOR") is not None:
         return False
     try:
-        return sys.stdout.isatty()
+        if not sys.stdout.isatty():
+            return False
     except (AttributeError, ValueError):
         return False
+    if os.name == "nt":
+        return _windows_vt100_ready()
+    return True
 
 
 class _C:

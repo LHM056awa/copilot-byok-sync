@@ -4,6 +4,18 @@ All notable changes to `clm-sync` are documented in this file.
 
 ---
 
+## 0.5.3 (2026-09-30)
+
+### Fixed
+
+- Windows 真控制台（conhost）默认不开 VT processing，之前只看 isatty() 就上色，导致 cmd 里出现裸转义码。现在 Windows 下先用 GetConsoleMode 探测、必要时 SetConsoleMode 开启 ENABLE_VIRTUAL_TERMINAL_PROCESSING；开启失败则回退纯文本。VS Code 集成终端等非真控制台句柄保持信任。
+
+### Changed
+
+- `Sync Custom Endpoints in WT` 任务改名为 `Sync Custom Endpoints (Console)`：通过 `start cmd` 启动独立 conhost 窗口，不再依赖 wt.exe（wt 是 COM 派发 stub，会导致 VS Code 任务完成信号丢失、下次运行弹“选择要终止的实例”）。
+
+---
+
 ## 0.5.2 (2026-09-28)
 
 ### Fixed

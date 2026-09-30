@@ -185,11 +185,10 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
       }
     },
     {
-      "label": "Sync Custom Endpoints in WT",
-      "command": "wt",
+      "label": "Sync Custom Endpoints (Console)",
+      "command": "start",
       "args": [
-        "-w",
-        "0",
+        "",
         "cmd",
         "/c",
         "python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
@@ -207,7 +206,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 **任务说明：**
 
 - `Sync Custom Endpoints`：在 VS Code 集成终端里同步全局配置。
-- `Sync Custom Endpoints in WT`：通过 `wt`（Windows Terminal）弹出一个新窗口运行同步，报告直接显示在窗口里。
+- `Sync Custom Endpoints (Console)`：通过 `start cmd` 弹出一个独立控制台窗口运行同步，报告直接显示在窗口里。
 
 **双击运行的批处理脚本。** 仓库根目录还提供：
 
@@ -252,3 +251,4 @@ copilot-byok-sync/
 - 将端点请求优化为多线程并发，减少多个端点依次等待造成的总耗时
 - 支持参数简写
 - 获取时自动忽略字段中包含 Video，Image，Audio 等非文本模型
+- 支持通过配置文件调整新增模型的预设

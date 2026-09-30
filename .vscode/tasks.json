@@ -22,20 +22,29 @@
 			}
 		},
 		{
-			"label": "Sync Custom Endpoints in WT",
-			"command": "wt",
+			"label": "Sync Custom Endpoints (Console)",
+			"type": "shell",
+			"command": "start",
 			"args": [
-				"-w",
-				"0",
+				"",
 				"cmd",
 				"/c",
 				"set PYTHONPATH=${workspaceFolder}\\src& python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
 			],
+			"options": {
+				"shell": {
+					"executable": "cmd.exe",
+					"args": [
+						"/d",
+						"/c"
+					]
+				}
+			},
 			"presentation": {
 				"reveal": "silent",
 				"close": true
 			},
-            "problemMatcher": []
+			"problemMatcher": []
 		}
 	]
 }
