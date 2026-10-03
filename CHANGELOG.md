@@ -4,6 +4,25 @@ All notable changes to `clm-sync` are documented in this file.
 
 ---
 
+## 0.6.0 (2026-10-02)
+
+### Added
+
+- **获取时自动忽略非文本模型**：同步 `/v1/models` 时只看远端条目的 `id` 与 `name`（大小写不敏感），命中即跳过、不新增入库；`vision` 为文本对话模型能力标记，不在过滤范围。报告新增黄色 `filtered non-text` 行。
+- **无文本信号端点不触发删除**：远端只返回非文本模型时视为无文本模型信号，跳过删除以保护本地文本模型（与请求失败同等保护）；报告新增黄色 `no text signal` 行。
+
+### Fixed
+
+- **关键词匹配边界**：短词根 `voice`/`dall`/`sora`/`imagen`/`music`/`image`/`embed` 改为独立 token 匹配（`embed` 另补 `embedding`/`embeddings` 派生形式，`text-embedding-3-large` 仍被过滤），不再误杀 `invoice-parser`、`medallion-7b`、`sorami-7b`、`imagenet-classifier`、`musical-theory-llm`、`imagery-chat`、`embedded-reasoning` 等文本模型；`gpt-image-1`、`image-gen`、`dall-e-3`、`sora-2` 等仍正常过滤。
+- **`diffusion` 词根改 token 匹配**：`diffusiongemma-26b-a4b-it` 这类用离散扩散方法训练的文本输出模型不再被误杀；`stable-diffusion-xl`、`text-to-image-diffusion`、`diffusion-3` 等真正图像生成模型仍过滤。
+- **token 匹配支持数字后缀**：边界由 `[a-z0-9]` 放宽为 `[a-z]`，`tts1`/`asr1`/`stt2`/`sora2`/`imagen4`/`dalle3` 现在能正常过滤；`matt`/`stts`/`asrock`/`ttsx`/`xtts` 仍不误杀。
+- **中文 VLM 对话模型不再误杀**：`name` 含「理解」时中文词根（视频/图像/图片/音频/语音/音乐）豁免，`图像理解`/`视频理解`/`图片理解` 保留；`图像生成器`/`视频解说` 仍过滤。豁免只作用于中文词根，不影响英文词根。
+- **手写的关键词模型不再被静默删除**：本地已存在且远端仍返回的模型（即使命中关键词被过滤）保留，不再连同 `settings` 一起删。副作用：已同步入库的媒体模型在远端仍返回时也不再被清理。
+- **多端点删除保护改为 endpoint 级**：一个端点的文本信号不再授权删除另一个端点的本地模型；无文本信号的端点通过 `no_signal_endpoints` 报告。
+- **重复 id 一文本一非文本时不再污染删除闸门**：同一 id 只要有一条文本条目即视为文本（与"远端仍返回即保留"一致），报告不再自相矛盾。
+
+---
+
 ## 0.5.3 (2026-09-30)
 
 ### Fixed

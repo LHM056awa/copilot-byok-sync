@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 CUSTOM_ENDPOINT_VENDOR = "customendpoint"
 
@@ -19,6 +19,12 @@ class FetchResult:
     model_ids: list[str] = field(default_factory=list)
     error: Optional[str] = None
     model_metadata: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Remote ids skipped as non-text (media) models during parsing
+    # (video/image/audio/embedding/... matched against id/name). Carried so
+    # the merge layer can report them and -- crucially -- skip deletion when
+    # an endpoint yielded *only* such models (there is no text-model signal
+    # to justify dropping local entries).
+    filtered_non_text: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -36,6 +42,19 @@ class ProviderSyncResult:
     # Entries that lacked a usable string id and were discarded from the
     # synced model list.
     discarded_invalid: list[Any] = field(default_factory=list)
+    # Remote model ids skipped because they look like non-text (media)
+    # models (video/image/audio/embedding/... matched against id/name).
+    # Display-only for the *addition* path: a filtered id is never added.
+    # It does NOT authorise deletion either -- a locally stored model whose
+    # id is still advertised (even if filtered) is kept, and an endpoint
+    # that advertised only media models never triggers deletion of its own
+    # url's models (see sync.merge_provider_models).
+    filtered_non_text: list[str] = field(default_factory=list)
+    # Endpoint urls that were fetched successfully but advertised no text
+    # model at all (only media models, or nothing usable).  Their silence
+    # carries no signal about which local models are stale, so models under
+    # these urls are never deleted.  Display-only; does not affect ok.
+    no_signal_endpoints: list[str] = field(default_factory=list)
     # Optional /v1/credits balance string, populated when credits are fetched.
     credits: Optional[str] = None
     # Index of this result's provider object inside the (post-sync) config
@@ -85,6 +104,120 @@ def normalize_id(raw: Any) -> str | None:
         return None
     value = raw.strip()
     return value or None
+
+
+# Substring markers: matched case-insensitively against a model's `id` and
+# `name` (separators `-_ ` are also stripped before matching, so `re-rank`
+# still hits `rerank`). These are long/distinctive enough for plain substring
+# matching. NOTE: `vision` is deliberately NOT here -- it marks vision-capable
+# *chat* models, which must keep syncing.
+NON_TEXT_SUBSTRING_MARKERS = (
+    "video",
+    "audio",
+    "rerank",  # rerank / reranker (plus re-rank via separator stripping)
+    "whisper",
+    "speech",
+    "midjourney",
+)
+
+# Chinese equivalents, in case a display name carries them.  Kept as plain
+# substrings (2-character roots are the natural unit in Chinese), but see
+# NON_TEXT_CHINESE_EXEMPT below: a name that also carries an "understanding"
+# word describes a vision/audio-capable *chat* model, not a media generator.
+NON_TEXT_CHINESE_MARKERS = (
+    "视频",
+    "图像",
+    "图片",
+    "音频",
+    "语音",
+    "音乐",
+)
+
+# When a name carries one of these, the Chinese markers above are ignored:
+# `图像理解` / `视频理解` / `图片理解` are VLM chat models (the Chinese
+# equivalent of the deliberately-excluded `vision`), not generators.
+NON_TEXT_CHINESE_EXEMPT = ("理解",)
+
+# Short roots that collide with ordinary English words (`voice` in
+# `invoice`, `dall` in `medallion`, `sora` in `sorami`, `imagen` in
+# `imagenet`, `music` in `musical`, `image` in `imagery`, `embed` in
+# `embedded`, `diffusion` in `diffusiongemma`).  These are matched only as
+# standalone tokens, so the colliding words survive.  Derived forms that MUST
+# still be caught are listed explicitly (`dalle` for `dalle3`,
+# `embedding`/`embeddings` for `text-embedding-3-large`).
+NON_TEXT_TOKEN_MARKERS = (
+    "tts",
+    "stt",
+    "asr",  # automatic speech recognition
+    "voice",
+    "dall",
+    "dalle",
+    "sora",
+    "imagen",
+    "music",
+    "image",
+    "embed",
+    "embedding",
+    "embeddings",
+    # `diffusion` names the *generation technique*, not the output modality:
+    # `diffusiongemma-26b-a4b-it` is a discrete-diffusion *text* model (VLM
+    # chat, image/video in -> text out) and must survive, while every real
+    # image generator spells it as its own token (`stable-diffusion-xl`,
+    # `text-to-image-diffusion`, `diffusion-3`).
+    "diffusion",
+)
+
+_TOKEN_PATTERN_CACHE: Dict[str, "re.Pattern[str]"] = {}
+
+
+def _token_pattern(token: str) -> "re.Pattern[str]":
+    """Return the cached standalone-token pattern for *token*.
+
+    The boundary class is ``[a-z]`` (not ``[a-z0-9]``) so a digit suffix --
+    the usual version spelling, e.g. ``tts1`` / ``sora2`` / ``imagen4`` --
+    still matches, while a letter continuation (``matt``, ``stts``,
+    ``asrock``, ``ttsx``, ``xtts``) does not.
+    """
+    pattern = _TOKEN_PATTERN_CACHE.get(token)
+    if pattern is None:
+        pattern = re.compile(r"(?<![a-z])" + re.escape(token) + r"(?![a-z])")
+        _TOKEN_PATTERN_CACHE[token] = pattern
+    return pattern
+
+
+def is_non_text_model(model_id: Any, name: Any = None) -> bool:
+    """Return True when a model looks like a non-text (media) model.
+
+    Only the model's ``id`` and display ``name`` are inspected ("只看 id +
+    name"). Matching is case-insensitive and runs in three passes per
+    candidate string:
+
+      1. long distinctive substrings (video/audio/rerank/whisper/...)
+      2. standalone short tokens (tts/stt/asr/voice/dall/sora/imagen/music/
+         image/embed/embedding/...), so `invoice` / `medallion` / `sorami` /
+         `imagenet` / `musical` / `imagery` / `embedded` are not caught
+      3. Chinese markers, skipped entirely when the string also carries an
+         "understanding" word (`图像理解` is a VLM chat model)
+
+    Non-string inputs never match.
+    """
+    candidates: List[Any] = [model_id, name]
+    for text in candidates:
+        if not isinstance(text, str) or not text:
+            continue
+        lowered = text.lower()
+        compact = re.sub(r"[-_\s]+", "", lowered)
+        for marker in NON_TEXT_SUBSTRING_MARKERS:
+            if marker in lowered or marker in compact:
+                return True
+        for token in NON_TEXT_TOKEN_MARKERS:
+            if _token_pattern(token).search(lowered):
+                return True
+        if not any(word in lowered for word in NON_TEXT_CHINESE_EXEMPT):
+            for marker in NON_TEXT_CHINESE_MARKERS:
+                if marker in lowered or marker in compact:
+                    return True
+    return False
 
 
 def base_display_name(model_id: str) -> str:

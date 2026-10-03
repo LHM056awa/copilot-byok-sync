@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from clm_sync import cli
@@ -216,6 +217,538 @@ class DisplayNameTest(unittest.TestCase):
             base_display_name("something.with.dots/inner-segment"),
         )
         self.assertEqual("Foo.bar.baz", base_display_name("foo.bar.baz"))
+
+
+class NonTextFilterTest(unittest.TestCase):
+    def test_is_non_text_model_markers(self):
+        from clm_sync.models import is_non_text_model
+
+        for model_id in (
+            "gpt-video-1",
+            "dall-e-3",
+            "sora-2",
+            "imagen-4",
+            "stable-diffusion-xl",
+            "midjourney-v7",
+            "text-embedding-3-large",
+            "bge-reranker-v2",
+            "re-rank-pro",
+            "whisper-large-v3",
+            "tts-1-hd",
+            "my-stt-model",
+            "asr-conformer",
+            "qvq-audio-72b",
+            "qwen-music-1",
+            "qwen-voice-chat",
+            "speech-t5",
+        ):
+            self.assertTrue(is_non_text_model(model_id), model_id)
+        # Name-only hit also filters.
+        self.assertTrue(is_non_text_model("some-model", "图像生成器"))
+        self.assertTrue(is_non_text_model("some-model", "视频解说"))
+        # Text chat models (incl. vision-capable) must NOT match.
+        for model_id in (
+            "gpt-4o",
+            "gpt-4o-mini",
+            "qwen3-8b",
+            "deepseek-chat",
+            "matt-7b",
+            "status-probe",
+        ):
+            self.assertFalse(is_non_text_model(model_id), model_id)
+        # vision marks vision-capable chat models, never a filter marker.
+        self.assertFalse(is_non_text_model("gpt-4o", "Vision Chat"))
+        self.assertFalse(is_non_text_model(None, None))
+
+    def test_parse_filters_non_text_ids(self):
+        payload = json.dumps(
+            {"data": [{"id": "chat-a"}, {"id": "gpt-video-1"}, {"id": "chat-b"}]}
+        )
+        self.assertEqual(["chat-a", "chat-b"], parse_models_payload(payload))
+
+    def test_parse_only_non_text_is_success_with_empty_ids(self):
+        from clm_sync.client import _parse_model_entries
+
+        ids, _, filtered = _parse_model_entries(
+            json.dumps({"data": [{"id": "gpt-video-1"}]})
+        )
+        self.assertEqual([], ids)
+        self.assertEqual(["gpt-video-1"], filtered)
+
+    def test_sync_never_adds_non_text_models(self):
+        cfg = [provider(models=[{"id": "chat-a", "name": "A", "url": "https://x.test"}])]
+        route = {
+            "https://x.test/v1/models": json.dumps(
+                {"data": [{"id": "chat-a"}, {"id": "gpt-video-1"}, {"id": "embed-x"}]}
+            )
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["chat-a"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual(["embed-x", "gpt-video-1"], outcome.providers[0].filtered_non_text)
+
+    def test_only_non_text_response_skips_deletion(self):
+        cfg = [
+            provider(
+                models=[
+                    {"id": "chat-a", "name": "A", "url": "https://x.test"},
+                    {"id": "old-video", "name": "Old Video", "url": "https://x.test"},
+                ]
+            )
+        ]
+        route = {"https://x.test/v1/models": json.dumps({"data": [{"id": "gpt-video-9"}]})}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(
+            ["chat-a", "old-video"], [m["id"] for m in outcome.config[0]["models"]]
+        )
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertTrue(outcome.providers[0].skipped_deletion)
+        self.assertEqual(["gpt-video-9"], outcome.providers[0].filtered_non_text)
+
+    def test_merge_layer_filters_direct_fetch_results(self):
+        cfg = [provider(models=[{"id": "chat-a", "name": "A", "url": "https://x.test"}])]
+        outcome = sync_config(
+            cfg,
+            lambda n, u: FetchResult(u, n, True, ["chat-a", "tts-direct"]),
+        )
+        self.assertEqual(["chat-a"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual(["tts-direct"], outcome.providers[0].filtered_non_text)
+
+    def test_report_lists_filtered_non_text(self):
+        from clm_sync.models import ProviderSyncResult
+
+        outcome = type(
+            "O",
+            (),
+            {
+                "providers": [
+                    ProviderSyncResult(
+                        name="P", changed=False, filtered_non_text=["gpt-video-1"]
+                    )
+                ]
+            },
+        )()
+        self.assertIn("filtered non-text", cli.render_report(outcome))
+        self.assertIn("gpt-video-1", cli.render_report(outcome))
+
+
+class NonTextKeywordBoundaryTest(unittest.TestCase):
+    """Boundary cases for the marker tables: short roots that collide with
+    ordinary English words must not fire, while the media models they are
+    meant to catch still must."""
+
+    def test_keyword_false_positives_not_filtered(self):
+        from clm_sync.models import is_non_text_model
+
+        # Each of these contains a marker as a *substring* but is a text
+        # model: `voice` in invoice, `dall` in medallion, `sora` in sorami,
+        # `imagen` in imagenet, `music` in musical, `image` in imagery,
+        # `embed` in embedded.
+        for model_id in (
+            "invoice-parser",
+            "invoice-llm",
+            "medallion-7b",
+            "sorami-7b",
+            "imagenet-classifier",
+            "musical-theory-llm",
+            "imagery-chat",
+            "embedded-reasoning",
+            "my-embedded-model",
+        ):
+            self.assertFalse(is_non_text_model(model_id), model_id)
+
+    def test_keyword_true_positives_still_filtered(self):
+        from clm_sync.models import is_non_text_model
+
+        # The token-ised roots must still catch the real media models,
+        # including the derived forms listed explicitly in the table.
+        for model_id in (
+            "dall-e-3",
+            "dalle3",
+            "sora-2",
+            "sora2",
+            "imagen-4",
+            "imagen4",
+            "music-gen",
+            "music2",
+            "gpt-image-1",
+            "image-gen",
+            "text-embedding-3-large",
+            "bge-embeddings",
+            "voice-chat",
+            "qwen-voice",
+            "whisper-large-v3",
+            "stable-diffusion-xl",
+            "midjourney-v7",
+            "speech-t5",
+            "qvq-audio-72b",
+            "bge-reranker-v2",
+            "re-rank-pro",
+        ):
+            self.assertTrue(is_non_text_model(model_id), model_id)
+
+    def test_chinese_understanding_names_not_filtered(self):
+        from clm_sync.models import is_non_text_model
+
+        # `理解` marks a vision/audio-capable *chat* model (the Chinese
+        # equivalent of the deliberately-excluded `vision`), so the Chinese
+        # markers are skipped for these names.
+        for name in ("图像理解", "视频理解", "图片理解"):
+            self.assertFalse(is_non_text_model("some-model", name), name)
+        # Generators keep being filtered.
+        for name in ("图像生成器", "视频解说", "语音合成"):
+            self.assertTrue(is_non_text_model("some-model", name), name)
+
+    def test_diffusion_root_is_token_matched(self):
+        """`diffusion` names the generation *technique*, not the output
+        modality: google/diffusiongemma-26b-a4b-it is a discrete-diffusion
+        TEXT model (image/video in -> text out, image-text-to-text pipeline)
+        and must survive, while every real image generator spells `diffusion`
+        as its own token and must still be filtered."""
+        from clm_sync.models import is_non_text_model
+
+        # False positives: `diffusion` glued into the model name.
+        for model_id in (
+            "diffusiongemma-26b-a4b-it",
+            "google/diffusiongemma-26b-a4b-it",
+            "diffusiongemma",
+        ):
+            self.assertFalse(is_non_text_model(model_id), model_id)
+        # True positives: real image generators keep `diffusion` as a token.
+        for model_id in (
+            "stable-diffusion-xl",
+            "text-to-image-diffusion",
+            "diffusion-3",
+            "diffusion3",
+            "sdxl-diffusion",
+            "gemini-diffusion",
+            "llada-diffusion",
+        ):
+            self.assertTrue(is_non_text_model(model_id), model_id)
+        # The official display name (one word) must not trip it either.
+        self.assertFalse(
+            is_non_text_model(
+                "google/diffusiongemma-26b-a4b-it", "DiffusionGemma 26B A4B IT"
+            )
+        )
+        # Known limitation (accepted): a gateway that splits the display name
+        # into two words still trips the token match -- pinned so a future
+        # change to the matching strategy is a conscious decision.
+        self.assertTrue(
+            is_non_text_model(
+                "google/diffusiongemma-26b-a4b-it", "Diffusion Gemma 26B A4B IT"
+            )
+        )
+
+    def test_token_markers_match_digit_suffixes(self):
+        from clm_sync.models import is_non_text_model
+
+        # A digit suffix is the usual version spelling and must not block a
+        # token match (`tts1` behaves like `tts-1`).
+        for model_id in ("tts1", "asr1", "stt2", "sora2", "imagen4", "dalle3"):
+            self.assertTrue(is_non_text_model(model_id), model_id)
+        # A letter continuation still blocks it, so ordinary words survive.
+        for model_id in ("matt", "stts", "asrock", "ttsx", "xtts"):
+            self.assertFalse(is_non_text_model(model_id), model_id)
+
+
+class NonTextDeleteGuardTest(unittest.TestCase):
+    """The non-text filter must never delete a locally stored model: an id the
+    remote still advertises is kept even when filtered, and an endpoint that
+    advertised no text model never authorises deletion of its own models."""
+
+    def test_local_keyword_model_kept_when_remote_advertises_it(self):
+        """A hand-authored model whose id matches a marker survives as long as
+        the endpoint keeps listing it -- filter applies to additions only."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "chat-a", "name": "A", "url": "https://x.test"},
+                    {
+                        "id": "tts-wrapper",
+                        "name": "My TTS Wrapper",
+                        "url": "https://x.test",
+                    },
+                ],
+                settings={"tts-wrapper": {"reasoningEffort": "max"}},
+            )
+        ]
+        route = {
+            "https://x.test/v1/models": json.dumps(
+                {"data": [{"id": "chat-a"}, {"id": "tts-wrapper"}]}
+            )
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(
+            ["chat-a", "tts-wrapper"], [m["id"] for m in outcome.config[0]["models"]]
+        )
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertEqual([], outcome.providers[0].added)
+        # The hand-authored settings entry is untouched.
+        self.assertEqual(
+            {"tts-wrapper": {"reasoningEffort": "max"}},
+            outcome.config[0]["settings"],
+        )
+        # It is still reported as filtered (it was not re-added).
+        self.assertEqual(["tts-wrapper"], outcome.providers[0].filtered_non_text)
+        self.assertFalse(outcome.changed)
+
+    def test_local_keyword_model_removed_when_remote_drops_it(self):
+        """The protection above must not over-reach: once the endpoint stops
+        advertising the id, it is deleted like any other stale model."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "chat-a", "name": "A", "url": "https://x.test"},
+                    {
+                        "id": "tts-wrapper",
+                        "name": "My TTS Wrapper",
+                        "url": "https://x.test",
+                    },
+                ],
+                settings={"tts-wrapper": {"reasoningEffort": "max"}},
+            )
+        ]
+        route = {"https://x.test/v1/models": json.dumps({"data": [{"id": "chat-a"}]})}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["chat-a"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual(["tts-wrapper"], outcome.providers[0].removed)
+        self.assertNotIn("settings", outcome.config[0])
+
+    def test_filtered_model_not_added_when_not_local(self):
+        cfg = [provider(models=[{"id": "chat-a", "name": "A", "url": "https://x.test"}])]
+        route = {
+            "https://x.test/v1/models": json.dumps(
+                {"data": [{"id": "chat-a"}, {"id": "embed-x"}]}
+            )
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["chat-a"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual(["embed-x"], outcome.providers[0].filtered_non_text)
+        self.assertEqual([], outcome.providers[0].added)
+
+    def test_previously_synced_media_model_persists(self):
+        """Accepted consequence of the keep rule: a media model that is already
+        in the config is not cleaned up while the endpoint still lists it."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "chat-a", "name": "A", "url": "https://x.test"},
+                    {"id": "gpt-video-1", "name": "Video 1", "url": "https://x.test"},
+                ]
+            )
+        ]
+        route = {
+            "https://x.test/v1/models": json.dumps(
+                {"data": [{"id": "chat-a"}, {"id": "gpt-video-1"}]}
+            )
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(
+            ["chat-a", "gpt-video-1"], [m["id"] for m in outcome.config[0]["models"]]
+        )
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertFalse(outcome.changed)
+
+    def test_multi_endpoint_media_only_endpoint_keeps_its_models(self):
+        """One endpoint's text signal must not authorise deleting another
+        endpoint's models: ep2 advertised only media, so B and C stay."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "A", "name": "A", "url": "https://ep1.test"},
+                    {"id": "B", "name": "B", "url": "https://ep2.test"},
+                    {"id": "C", "name": "C", "url": "https://ep2.test"},
+                ]
+            )
+        ]
+        route = {
+            "https://ep1.test/v1/models": json.dumps({"data": [{"id": "A"}]}),
+            "https://ep2.test/v1/models": json.dumps({"data": [{"id": "embed-y"}]}),
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(
+            ["A", "B", "C"], [m["id"] for m in outcome.config[0]["models"]]
+        )
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertTrue(outcome.providers[0].skipped_deletion)
+
+    def test_multi_endpoint_text_endpoint_still_deletes_its_stale(self):
+        """The per-endpoint gate must not over-reach: a stale model under the
+        endpoint that DID return text is still deleted."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "A", "name": "A", "url": "https://ep1.test"},
+                    {"id": "stale", "name": "S", "url": "https://ep1.test"},
+                    {"id": "B", "name": "B", "url": "https://ep2.test"},
+                ]
+            )
+        ]
+        route = {
+            "https://ep1.test/v1/models": json.dumps({"data": [{"id": "A"}]}),
+            "https://ep2.test/v1/models": json.dumps({"data": [{"id": "embed-y"}]}),
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["A", "B"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual(["stale"], outcome.providers[0].removed)
+
+    def test_multi_endpoint_both_media_only_keeps_everything(self):
+        cfg = [
+            provider(
+                models=[
+                    {"id": "B", "name": "B", "url": "https://ep1.test"},
+                    {"id": "C", "name": "C", "url": "https://ep2.test"},
+                ]
+            )
+        ]
+        route = {
+            "https://ep1.test/v1/models": json.dumps({"data": [{"id": "embed-y"}]}),
+            "https://ep2.test/v1/models": json.dumps({"data": [{"id": "tts-z"}]}),
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["B", "C"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertEqual(
+            ["https://ep1.test", "https://ep2.test"],
+            outcome.providers[0].no_signal_endpoints,
+        )
+
+    def test_multi_endpoint_failed_endpoint_blocks_all_deletion(self):
+        """The pre-existing global gate is unchanged: any failed endpoint keeps
+        every model, including stale ones under a healthy endpoint."""
+        cfg = [
+            provider(
+                models=[
+                    {"id": "A", "name": "A", "url": "https://ep1.test"},
+                    {"id": "stale", "name": "S", "url": "https://ep1.test"},
+                    {"id": "B", "name": "B", "url": "https://ep2.test"},
+                ]
+            )
+        ]
+        route = {"https://ep1.test/v1/models": json.dumps({"data": [{"id": "A"}]})}
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(
+            ["A", "stale", "B"], [m["id"] for m in outcome.config[0]["models"]]
+        )
+        self.assertEqual([], outcome.providers[0].removed)
+        self.assertTrue(outcome.providers[0].errors)
+        # A failed endpoint is not a "no signal" endpoint.
+        self.assertEqual([], outcome.providers[0].no_signal_endpoints)
+
+    def test_no_signal_endpoints_reported(self):
+        cfg = [
+            provider(
+                models=[
+                    {"id": "A", "name": "A", "url": "https://ep1.test"},
+                    {"id": "B", "name": "B", "url": "https://ep2.test"},
+                ]
+            )
+        ]
+        route = {
+            "https://ep1.test/v1/models": json.dumps({"data": [{"id": "A"}]}),
+            "https://ep2.test/v1/models": json.dumps({"data": [{"id": "embed-y"}]}),
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(
+            ["https://ep2.test"], outcome.providers[0].no_signal_endpoints
+        )
+        report = cli.render_report(outcome)
+        self.assertIn("no text signal", report)
+        self.assertIn("https://ep2.test", report)
+
+    def test_no_signal_endpoints_empty_when_all_have_text(self):
+        cfg = [
+            provider(
+                models=[
+                    {"id": "A", "name": "A", "url": "https://ep1.test"},
+                    {"id": "B", "name": "B", "url": "https://ep2.test"},
+                ]
+            )
+        ]
+        route = {
+            "https://ep1.test/v1/models": json.dumps({"data": [{"id": "A"}]}),
+            "https://ep2.test/v1/models": json.dumps({"data": [{"id": "B"}]}),
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual([], outcome.providers[0].no_signal_endpoints)
+        self.assertFalse(outcome.providers[0].skipped_deletion)
+        self.assertNotIn("no text signal", cli.render_report(outcome))
+
+
+class NonTextDuplicateIdTest(unittest.TestCase):
+    """A duplicate id is judged as a whole: it is filtered only when every
+    entry carrying it looks non-text, so the same id can never be reported as
+    both kept and filtered."""
+
+    def test_duplicate_id_with_one_text_entry_is_kept(self):
+        from clm_sync.client import _parse_model_entries
+
+        ids, metadata, filtered = _parse_model_entries(
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "x", "name": "Image Gen"},
+                        {"id": "x", "name": "Chat"},
+                    ]
+                }
+            )
+        )
+        self.assertEqual(["x"], ids)
+        self.assertEqual([], filtered)
+        # Metadata comes from the first *text* entry, so the merge layer's
+        # re-check agrees with the parse layer.
+        self.assertEqual("Chat", metadata["x"]["name"])
+
+    def test_duplicate_id_text_entry_first_is_also_kept(self):
+        from clm_sync.client import _parse_model_entries
+
+        ids, metadata, filtered = _parse_model_entries(
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "x", "name": "Chat"},
+                        {"id": "x", "name": "Image Gen"},
+                    ]
+                }
+            )
+        )
+        self.assertEqual(["x"], ids)
+        self.assertEqual([], filtered)
+        self.assertEqual("Chat", metadata["x"]["name"])
+
+    def test_duplicate_id_all_non_text_entries_is_filtered(self):
+        from clm_sync.client import _parse_model_entries
+
+        ids, _, filtered = _parse_model_entries(
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "x", "name": "Image Gen"},
+                        {"id": "x", "name": "Video Gen"},
+                    ]
+                }
+            )
+        )
+        self.assertEqual([], ids)
+        self.assertEqual(["x"], filtered)
+
+    def test_duplicate_id_report_is_not_contradictory(self):
+        """End-to-end: the id must not appear as both kept and filtered."""
+        cfg = [provider(models=[{"id": "x", "name": "X", "url": "https://x.test"}])]
+        route = {
+            "https://x.test/v1/models": json.dumps(
+                {
+                    "data": [
+                        {"id": "x", "name": "Image Gen"},
+                        {"id": "x", "name": "Chat"},
+                    ]
+                }
+            )
+        }
+        outcome = sync_config(cfg, lambda n, u: _fetch(n, u, route))
+        self.assertEqual(["x"], [m["id"] for m in outcome.config[0]["models"]])
+        self.assertEqual([], outcome.providers[0].filtered_non_text)
+        self.assertNotIn("filtered non-text", cli.render_report(outcome))
 
 
 class SyncTest(unittest.TestCase):
@@ -1501,7 +2034,7 @@ class ColoringTest(unittest.TestCase):
     def test_non_tty_stdout_is_plain(self):
         with patch.object(sys.stdout, "isatty", return_value=False), patch(
             "clm_sync.cli.os.name", "nt"
-        ), patch.dict(os.environ, {}):
+        ), patch.dict(os.environ, {}, clear=True):
             self.assertFalse(cli._stdout_color_enabled())
 
     def test_non_windows_tty_stays_coloured(self):
@@ -1510,16 +2043,16 @@ class ColoringTest(unittest.TestCase):
         with patch.object(sys.stdout, "isatty", return_value=True), patch(
             "clm_sync.cli.os.name", "posix"
         ), patch("clm_sync.cli._windows_vt100_ready") as probe, patch.dict(
-            os.environ, {}
+            os.environ, {}, clear=True
         ):
             self.assertTrue(cli._stdout_color_enabled())
-            probe.assert_not_called(), "non-Windows must not run the VT probe"
+            probe.assert_not_called()
 
     def test_windows_tty_with_vt_ready_is_coloured(self):
         with patch.object(sys.stdout, "isatty", return_value=True), patch(
             "clm_sync.cli.os.name", "nt"
         ), patch("clm_sync.cli._windows_vt100_ready", return_value=True) as probe, patch.dict(
-            os.environ, {}
+            os.environ, {}, clear=True
         ):
             self.assertTrue(cli._stdout_color_enabled())
             probe.assert_called_once()
@@ -1530,7 +2063,7 @@ class ColoringTest(unittest.TestCase):
         with patch.object(sys.stdout, "isatty", return_value=True), patch(
             "clm_sync.cli.os.name", "nt"
         ), patch("clm_sync.cli._windows_vt100_ready", return_value=False), patch.dict(
-            os.environ, {}
+            os.environ, {}, clear=True
         ):
             self.assertFalse(cli._stdout_color_enabled())
 
@@ -1576,7 +2109,7 @@ class CliTest(unittest.TestCase):
             path = os.path.join(tmp, "cfg.json")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(serialize(cfg))
-            before = open(path, encoding="utf-8").read()
+            before = Path(path).read_text(encoding="utf-8")
             with patch(
                 "clm_sync.cli.fetch_models",
                 return_value=FetchResult(
@@ -1588,7 +2121,7 @@ class CliTest(unittest.TestCase):
             ), patch("clm_sync.cli.fetch_credits", return_value="100 USD"):
                 code = cli.run(["--config", path, "--all", "--dry-run"])
             self.assertEqual(cli.EXIT_OK, code)
-            self.assertEqual(before, open(path, encoding="utf-8").read())
+            self.assertEqual(before, Path(path).read_text(encoding="utf-8"))
 
     def test_missing_config_returns_config_error(self):
         self.assertEqual(
@@ -1603,7 +2136,7 @@ class CliTest(unittest.TestCase):
             path = os.path.join(tmp, "cfg.json")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(serialize(cfg))
-            before = open(path, encoding="utf-8").read()
+            before = Path(path).read_text(encoding="utf-8")
 
             def failing(name, base_url, timeout=None, api_key=None):
                 return FetchResult(
@@ -1621,7 +2154,7 @@ class CliTest(unittest.TestCase):
             ):
                 code = cli.run(["--config", path, "--all"])
             self.assertEqual(cli.EXIT_PARTIAL_FAILURE, code)
-            self.assertEqual(before, open(path, encoding="utf-8").read())
+            self.assertEqual(before, Path(path).read_text(encoding="utf-8"))
             self.assertIn("HTTP 401", stderr.getvalue())
 
     def test_config_fixture_parses(self):

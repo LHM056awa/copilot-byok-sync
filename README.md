@@ -114,7 +114,18 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 远端的 `object`、`created`、`owned_by` 等 API 协议字段不会写入配置。默认值为 `toolCalling: true`、`vision: true`、`maxInputTokens: 1000000`、`maxOutputTokens: 384000`，以及 `supportsReasoningEffort: ["max"]`；如果远端返回这些配置字段，则优先保留远端值。
 
-已存在且仍被远端返回的模型保持本地原有配置不变。
+已存在且仍被远端返回的模型保持本地原有配置不变——**包括命中关键词被过滤的模型**：只要远端原始列表里还有这个 id，本地条目（及其 `settings`）就保留，不会被静默删除。同理，**已经同步入库的媒体模型（如 `gpt-video-1`），只要远端仍返回该 id 也会保留，不再被自动清理；只有远端不再返回该 id 时才删除**。
+
+## 非文本模型过滤
+
+获取 `/v1/models` 时自动忽略非文本模型：只看远端条目的 `id` 与 `name`（大小写不敏感），命中即跳过、不新增入库；报告里以 `filtered non-text` 行列出。
+
+- **子串命中**（长且独特，无碰撞风险）：`video`、`audio`、`rerank`（含 `re-rank`）、`whisper`、`speech`、`midjourney`
+- **独立 token 命中**（前后不能是字母，数字后缀可命中）：`tts`、`stt`、`asr`、`voice`、`dall`、`dalle`、`sora`、`imagen`、`music`、`image`、`embed`、`embedding`、`embeddings`、`diffusion`
+  - 因此 `invoice-parser`（含 `voice`）、`medallion-7b`（含 `dall`）、`sorami-7b`（含 `sora`）、`imagenet-classifier`（含 `imagen`）、`musical-theory-llm`（含 `music`）、`imagery-chat`（含 `image`）、`embedded-reasoning`（含 `embed`）、`diffusiongemma-26b-a4b-it`（含 `diffusion`，离散扩散**文本**模型）**不会**被误杀
+  - `tts1`、`asr1`、`sora2`、`imagen4`、`dalle3`、`diffusion3` 等数字后缀命名正常过滤
+- **中文词根**：`视频`、`图像`、`图片`、`音频`、`语音`、`音乐`；当 `name` 含「理解」时豁免（`图像理解`/`视频理解`/`图片理解` 是 VLM 对话模型，保留）
+- `vision` 是文本对话模型的多模态能力标记，**不在**过滤范围内
 
 ## 删除规则
 
@@ -124,13 +135,15 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 - 未使用 `--no-delete`。
 - provider 的所有端点请求都成功。
-- 每个成功响应都包含至少一个有效模型 ID。
+- 每个成功响应都包含至少一个有效**文本**模型 ID。删除授权是 **endpoint 级**的：某个端点只返回非文本模型时，该端点 url 下的本地模型全部保留（其他端点的文本信号不授权删除它）；这类端点会在报告里以 `no text signal` 行列出。
 
 如果任一端点返回 `401`、请求超时、网络错误或响应格式无效，当前 provider 会跳过删除，并保留本地已有模型。使用 `--no-delete` 时，无论远端结果如何都只新增模型，不删除或覆盖本地已有模型。
 
 **顺序语义。** 默认**保留你手排的模型顺序**，新模型**追加到列表末尾**；没有实质变更的同步不会重写文件。加 `--sort` 参数可顺带把每个端点的模型列表按 id 字典序升序（大小写敏感，`Z` 排在 `a` 前）重排——首次排序会重写一次，此后顺序已稳定，再跑 `--sort` 即 no-op。
 
 **本地重复 id。** 同一个 id 在本地出现多条时，`--no-delete` 下**全部保留**；允许删除且远端已不下发该 id 时，所有重复条目会**一并删除**。
+
+**远端重复 id。** 同一 id 在远端出现多条时，只要其中**有一条**是文本模型，该 id 即视为文本模型（保留/新增）；全部条目都是非文本时才过滤。
 
 ## 安全性说明
 
@@ -149,7 +162,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 | `added (...)` | 绿 | 新加入的模型 |
 | `removed (...)` / `error: ...` | 红 | 被删除的模型 / 请求失败 |
 | `credits: ...` | 青 | 账户余额（纯展示信息） |
-| `deletion skipped ...` / `discarded invalid entries ...` / `warning: no endpoint url ...` | 黄 | 需要注意的提示（删除被跳过、无效条目被清理、端点缺失） |
+| `deletion skipped ...` / `filtered non-text ...` / `no text signal ...` / `discarded invalid entries ...` / `warning: no endpoint url ...` | 黄 | 需要注意的提示（删除被跳过、非文本模型被过滤、端点无文本信号、无效条目被清理、端点缺失） |
 | `Summary: ...` | 加粗 | 汇总行 |
 
 **着色启用条件：**
@@ -163,45 +176,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ## 工作区推荐配置
 
-在 `.vscode/tasks.json` 中添加以下任务，让它变成快捷键。该任务同步的是**全局配置**（用户数据目录下 VS Code 实际生效的文件，`%APPDATA%\Code\User\chatLanguageModels.json`）：
-
-```json
-{
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "Sync Custom Endpoints",
-      "command": "python",
-      "args": [
-        "-m",
-        "clm_sync.cli",
-        "--config",
-        "${env:APPDATA}/Code/User/chatLanguageModels.json",
-        "--all"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      }
-    },
-    {
-      "label": "Sync Custom Endpoints (Console)",
-      "command": "start",
-      "args": [
-        "",
-        "cmd",
-        "/c",
-        "python -m clm_sync.cli --config \"%APPDATA%\\Code\\User\\chatLanguageModels.json\" --all & echo. & pause"
-      ],
-      "presentation": {
-        "reveal": "silent",
-        "close": true
-      },
-      "problemMatcher": []
-    }
-  ]
-}
-```
+在 [.vscode/tasks.json](.vscode/tasks.json) 同步的是**全局配置**（用户数据目录下 VS Code 实际生效的文件，`%APPDATA%\Code\User\chatLanguageModels.json`）：
 
 **任务说明：**
 
@@ -227,7 +202,7 @@ python -m pytest tests/test_sync.py -v
 ```
 copilot-byok-sync/
 ├── .vscode/
-│   └── tasks.json            # 工作区级同步任务（含 WT 窗口版）
+│   └── tasks.json            # 工作区级同步任务（含独立控制台窗口版）
 ├── src/clm_sync/
 │   ├── __init__.py
 │   ├── __main__.py
@@ -250,5 +225,5 @@ copilot-byok-sync/
 
 - 将端点请求优化为多线程并发，减少多个端点依次等待造成的总耗时
 - 支持参数简写
-- 获取时自动忽略字段中包含 Video，Image，Audio 等非文本模型
 - 支持通过配置文件调整新增模型的预设
+- 优化 `name` 的大小写逻辑

@@ -2,7 +2,7 @@
 rem ============================================================
 rem  Auto-sync the GLOBAL chatLanguageModels.json
 rem  Equivalent to the VS Code "Sync Custom Endpoints" task
-rem  (.vscode/tasks.json):  python -m clm_sync.cli --config <global> --all
+rem  (.vscode/tasks.json):  python -m clm_sync.cli --config GLOBAL --all
 rem
 rem  - Syncs every vendor=customendpoint provider's model list
 rem  - Auto-fetches account balance for known vendors (shown in the report)

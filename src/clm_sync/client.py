@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Optional, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
-from .models import FetchResult, normalize_id
+from .models import FetchResult, is_non_text_model, normalize_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -88,7 +88,9 @@ def resolve_models_url(base_url: str) -> str:
     )
 
 
-def _parse_model_entries(body: str) -> tuple[list[str], Dict[str, Dict[str, Any]]]:
+def _parse_model_entries(
+    body: str,
+) -> tuple[list[str], Dict[str, Dict[str, Any]], list[str]]:
     """Extract model ids and their metadata from a /v1/models body.
 
     Accepts the OpenAI shape {"data": [...]}, a bare list of objects or
@@ -97,6 +99,19 @@ def _parse_model_entries(body: str) -> tuple[list[str], Dict[str, Dict[str, Any]
     transport-level failure: iterating a dict's *keys* or a string's
     *characters* would fabricate garbage model ids, which under default
     delete rules would destroy the local model list.
+
+    Entries whose ``id``/``name`` look like non-text (media) models
+    (video/image/audio/embedding/...) are skipped here and returned as the
+    third tuple element, so they never enter the sync pipeline.  A response
+    yielding *only* such models is still a success (with an empty id list)
+    so the caller can skip deletion instead of reporting a failure.
+
+    Duplicate ids are judged as a whole: an id is filtered only when *every*
+    entry carrying it looks non-text.  If any entry for that id looks like a
+    text model, the id is kept (and its metadata comes from the first such
+    entry), so the same id can never appear in both the kept and the filtered
+    list -- which would otherwise contradict itself in the report and feed a
+    bogus text signal into the delete guard.
     """
     try:
         payload: Any = json.loads(body)
@@ -118,26 +133,45 @@ def _parse_model_entries(body: str) -> tuple[list[str], Dict[str, Dict[str, Any]
     if not isinstance(raw_items, list):
         raise TransportError("'data' is not a list of model entries")
 
-    seen: Dict[str, None] = {}
-    metadata: Dict[str, Dict[str, Any]] = {}
+    # Pass 1: collect a verdict per id.  An id is text if ANY entry carrying
+    # it looks like a text model; only an all-non-text id is filtered.
+    verdicts: Dict[str, Dict[str, Any]] = {}
     for item in raw_items:
         raw_id: Any = item if isinstance(item, str) else None
+        raw_name: Any = None
         if isinstance(item, dict):
             raw_id = item.get("id", item.get("name"))
+            raw_name = item.get("name")
         model_id = normalize_id(raw_id)
-        if model_id is not None:
-            seen.setdefault(model_id, None)
-            if isinstance(item, dict):
-                metadata.setdefault(model_id, dict(item))
+        if model_id is None:
+            continue
+        record = verdicts.setdefault(model_id, {"text": False, "item": None})
+        if not is_non_text_model(model_id, raw_name):
+            record["text"] = True
+            if isinstance(item, dict) and record["item"] is None:
+                record["item"] = dict(item)
 
-    if not seen:
+    # Pass 2: split into kept (with metadata) and filtered, preserving the
+    # order in which each id was first seen.
+    seen: Dict[str, None] = {}
+    metadata: Dict[str, Dict[str, Any]] = {}
+    filtered: Dict[str, None] = {}
+    for model_id, record in verdicts.items():
+        if record["text"]:
+            seen.setdefault(model_id, None)
+            if record["item"] is not None:
+                metadata.setdefault(model_id, record["item"])
+        else:
+            filtered.setdefault(model_id, None)
+
+    if not seen and not filtered:
         raise TransportError("no usable model ids found in response")
-    return list(seen.keys()), metadata
+    return list(seen.keys()), metadata, list(filtered.keys())
 
 
 def parse_models_payload(body: str) -> list[str]:
     """Extract de-duplicated, order-preserving model ids from a /v1/models body."""
-    model_ids, _ = _parse_model_entries(body)
+    model_ids, _, _ = _parse_model_entries(body)
     return model_ids
 
 
@@ -204,7 +238,7 @@ def fetch_models(
     call = transport or default_transport
     try:
         body = call(url, timeout, api_key)
-        model_ids, model_metadata = _parse_model_entries(body)
+        model_ids, model_metadata, filtered_non_text = _parse_model_entries(body)
     except TransportError as exc:
         LOGGER.debug("%s: %s failed: %s", provider_name, url, exc)
         return FetchResult(
@@ -228,6 +262,7 @@ def fetch_models(
         success=True,
         model_ids=model_ids,
         model_metadata=model_metadata,
+        filtered_non_text=filtered_non_text,
     )
 
 def _json_path(payload: Any, path: str) -> tuple[bool, Any]:

@@ -305,6 +305,23 @@ def render_report(outcome, *, color: bool = False) -> str:
             )
         if provider.skipped_deletion:
             lines.append(_paint(c, c.yellow, "    deletion skipped: keeping existing models"))
+        if provider.filtered_non_text:
+            lines.append(
+                f"{_paint(c, c.yellow, '    filtered non-text')} "
+                "({}) — id/name matched video/image/audio/...: {}".format(
+                    len(provider.filtered_non_text),
+                    ", ".join(provider.filtered_non_text),
+                )
+            )
+        if provider.no_signal_endpoints:
+            lines.append(
+                f"{_paint(c, c.yellow, '    no text signal')} "
+                "({}) — endpoint(s) returned no text model, their local "
+                "models were kept: {}".format(
+                    len(provider.no_signal_endpoints),
+                    ", ".join(provider.no_signal_endpoints),
+                )
+            )
         if provider.discarded_invalid:
             lines.append(
                 f"{_paint(c, c.yellow, '    discarded invalid entries')} "

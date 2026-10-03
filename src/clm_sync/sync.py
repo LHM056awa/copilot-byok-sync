@@ -27,6 +27,7 @@ from .models import (
     base_display_name,
     endpoint_base_urls,
     is_custom_endpoint,
+    is_non_text_model,
     is_secret_placeholder,
     normalize_id,
 )
@@ -154,6 +155,16 @@ def merge_provider_models(
     rewritten on no-op runs.  When *sort_models* is set, the merged list is
     instead written in ascending model-id order (case-sensitive
     lexicographic order).
+
+    Non-text (media) models -- whose ``id``/``name`` match
+    ``models.is_non_text_model`` (video/image/audio/embedding/...) -- are
+    never *added*.  They are not deleted either: a locally stored entry whose
+    id the remote still advertises (even if that id is filtered) is kept, so
+    a hand-authored model that happens to match a marker survives as long as
+    the endpoint keeps listing it.  Deletion is additionally gated per
+    endpoint: an endpoint that advertised no text model at all carries no
+    signal about which of *its* local models are stale, so those are kept
+    (same protection as a failed fetch, but scoped to that url).
     """
     result = ProviderSyncResult(name=provider_name)
 
@@ -171,23 +182,86 @@ def merge_provider_models(
         result.discarded_invalid = discarded
     remote_by_url: Dict[str, List[str]] = {}
     remote_metadata: Dict[str, Dict[str, Any]] = {}
+    filtered_non_text: List[str] = []
+    # Two views of each successful endpoint's response:
+    #   raw_by_url  -- every id the endpoint advertised, *including* ones the
+    #                  non-text filter dropped.  This is the "the remote still
+    #                  knows this id" evidence used to keep a locally stored
+    #                  entry (so a hand-authored `tts-wrapper` survives as
+    #                  long as the endpoint still lists it).
+    #   text_by_url -- only the text ids, i.e. the ones eligible to be added
+    #                  and the only ones that authorise deletion for that url.
+    raw_by_url: Dict[str, Dict[str, None]] = {}
+    text_by_url: Dict[str, Dict[str, None]] = {}
     for res in results:
         if res.success:
-            remote_by_url.setdefault(res.base_url, []).extend(res.model_ids)
-            for model_id, metadata in res.model_metadata.items():
-                remote_metadata.setdefault(model_id, metadata)
+            # Carry over ids already filtered during parsing (client.py),
+            # so the report explains what was ignored even when the merge
+            # layer sees an empty id list.
+            for skipped_id in res.filtered_non_text:
+                if skipped_id not in filtered_non_text:
+                    filtered_non_text.append(skipped_id)
+                raw_by_url.setdefault(res.base_url, {}).setdefault(skipped_id, None)
+            kept_ids: List[str] = []
+            for model_id in res.model_ids:
+                raw_by_url.setdefault(res.base_url, {}).setdefault(model_id, None)
+                metadata = res.model_metadata.get(model_id, {})
+                meta_name = metadata.get("name") if isinstance(metadata, dict) else None
+                if is_non_text_model(model_id, meta_name):
+                    if model_id not in filtered_non_text:
+                        filtered_non_text.append(model_id)
+                    continue
+                kept_ids.append(model_id)
+                if isinstance(metadata, dict):
+                    remote_metadata.setdefault(model_id, metadata)
+            remote_by_url.setdefault(res.base_url, []).extend(kept_ids)
+            text_by_url.setdefault(res.base_url, {})
+            for model_id in kept_ids:
+                text_by_url[res.base_url].setdefault(model_id, None)
+    if filtered_non_text:
+        result.filtered_non_text = sorted(filtered_non_text, key=str.lower)
 
     all_remote_ids: Dict[str, None] = {}
     for ids in remote_by_url.values():
         for model_id in ids:
             all_remote_ids.setdefault(model_id, None)
 
-    all_succeeded = bool(results) and all(r.success for r in results)
-    can_delete = allow_delete and all_succeeded
+    # Every id the remote still advertises, filtered or not.  A local entry
+    # whose id is in here is kept: the endpoint has not dropped it, so the
+    # non-text filter must not be allowed to delete it.
+    all_raw_ids: Dict[str, None] = {}
+    for ids in raw_by_url.values():
+        for model_id in ids:
+            all_raw_ids.setdefault(model_id, None)
 
-    # Keep existing models (with all their metadata) when still advertised, or
-    # when deletion is not safe.  Duplicates of an id are all kept or all
-    # dropped together, so no locally authored entry is lost silently.
+    all_succeeded = bool(results) and all(r.success for r in results)
+    can_delete_globally = allow_delete and all_succeeded
+
+    # Endpoints that succeeded but advertised no text model at all: their
+    # silence says nothing about which local models are stale, so models
+    # under those urls are never deleted.  This is per-endpoint on purpose --
+    # one endpoint's text signal must not authorise deleting another
+    # endpoint's models.
+    no_signal_endpoints = sorted(
+        (url for url, ids in text_by_url.items() if not ids), key=str.lower
+    )
+    if no_signal_endpoints:
+        result.no_signal_endpoints = no_signal_endpoints
+
+    def _can_delete_url(url: Any) -> bool:
+        """True when *url*'s response authorises deleting its local models."""
+        if not can_delete_globally:
+            return False
+        if isinstance(url, str) and url in text_by_url:
+            return bool(text_by_url[url])
+        # Unknown/absent url (e.g. a hand-authored entry with no url): fall
+        # back to the provider-wide signal so existing behaviour is kept.
+        return bool(all_remote_ids)
+
+    # Keep existing models (with all their metadata) when the remote still
+    # advertises the id (filtered or not), or when deletion is not safe for
+    # this entry's endpoint.  Duplicates of an id are all kept or all dropped
+    # together, so no locally authored entry is lost silently.
     ordered: List[Dict[str, Any]] = []
     surviving_ids: set = set()
     if isinstance(existing_models, list):
@@ -197,7 +271,7 @@ def merge_provider_models(
             model_id = normalize_id(entry.get("id"))
             if model_id is None:
                 continue
-            if model_id in all_remote_ids or not can_delete:
+            if model_id in all_raw_ids or not _can_delete_url(entry.get("url")):
                 ordered.append(copy.deepcopy(entry))
                 surviving_ids.add(model_id)
 
@@ -230,11 +304,15 @@ def merge_provider_models(
                 if entry_id is not None:
                     existing_ids.add(entry_id)
 
-    if can_delete:
+    if can_delete_globally:
         result.removed = sorted(existing_ids - surviving_ids, key=str.lower)
     result.added = sorted(surviving_ids - existing_ids, key=str.lower)
     result.kept = len(existing_ids & surviving_ids)
-    result.skipped_deletion = bool(results) and not can_delete
+    # Deletion was skipped when the global gate blocked it, or when at least
+    # one endpoint had no text signal (its models were kept on purpose).
+    result.skipped_deletion = bool(results) and (
+        not can_delete_globally or bool(no_signal_endpoints)
+    )
 
     # Optional canonical order: ascending model-id order in strict
     # lexicographic (dictionary) order, i.e. case-sensitive codepoint
