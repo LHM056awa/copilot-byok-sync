@@ -2,6 +2,12 @@
 
 All notable changes to `clm-sync` are documented in this file.
 
+## 0.6.1 (2026-10-09)
+
+### Fixed
+
+- **交互式终端下不再重复打印报告**：此前当 provider 有失败时，报告会打印两遍——stdout 一份带色、stderr 一份无色。原因是 stderr 副本的判断条件 `failed and plain_report` 把"是否有失败"与"用户能否看到 stdout"两个正交维度混在一起。现改为**仅在 stdout 不是交互式 TTY**（重定向 / 管道 / CI）时镜像 stderr 副本，且恒为纯文本；交互式终端下只打一份。正向副作用：零失败运行的 CI 现在也能从 stderr 拿到完整报告。
+
 ---
 
 ## 0.6.0 (2026-10-02)

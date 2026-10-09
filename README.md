@@ -170,7 +170,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 - 仅当标准输出（stdout）是**交互式 TTY**（终端直接显示）时输出 ANSI 颜色。
 - 当 stdout 被**重定向或管道**（如 `> log`、`| grep`）时自动输出纯文本，日志保持干净。
 - 设置环境变量 **`NO_COLOR`**（任意值，如 `NO_COLOR=1`）可全局强制关闭颜色。
-- 打印到标准错误（stderr）的机器可读副本**始终是纯文本**（不带色码），供脚本 / CI 抓取。
+- 当标准输出**不是交互式终端**（重定向 / 管道 / CI）时，完整报告会以**纯文本**（不带色码）镜像到标准错误（stderr），供脚本 / CI 抓取。
 
 颜色**默认自动探测**：交互式终端直接显示时上色，重定向 / 管道 / 设置了 `NO_COLOR` 时自动输出纯文本，无需任何手动操作。`NO_COLOR`（如 `NO_COLOR=1`）只是可选开关，仅当你的终端**支持 TTY 但无法渲染 ANSI**（老版 conhost、部分远程会话）而看到裸转义码时才需手动设置；现代 Windows Terminal 无需理会。
 

@@ -2130,7 +2130,10 @@ class CliTest(unittest.TestCase):
 
     def test_failed_endpoint_without_changes_reports_errors_to_stderr(self):
         """Regression: a 401/network failure that keeps the file unchanged must
-        still surface the per-provider errors (to stderr), not just exit code 1."""
+        still surface the per-provider errors (to stderr), not just exit code 1.
+
+        stdout is explicitly pinned to non-TTY so the assertion does not rely
+        on unittest's stdout happening to be a pipe."""
         cfg = [provider(models=[{"id": "seed", "name": "S", "url": "https://x.test"}])]
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "cfg.json")
@@ -2150,12 +2153,96 @@ class CliTest(unittest.TestCase):
             with (
                 patch("clm_sync.cli.fetch_models", side_effect=failing),
                 patch("clm_sync.cli.fetch_credits", return_value=None),
+                patch.object(sys.stdout, "isatty", return_value=False),
                 patch("sys.stderr", stderr),
             ):
                 code = cli.run(["--config", path, "--all"])
             self.assertEqual(cli.EXIT_PARTIAL_FAILURE, code)
             self.assertEqual(before, Path(path).read_text(encoding="utf-8"))
             self.assertIn("HTTP 401", stderr.getvalue())
+
+    def test_tty_run_does_not_duplicate_report_on_stderr(self):
+        """Regression: on an interactive TTY the report is already visible on
+        stdout, so stderr must stay empty (no uncoloured duplicate)."""
+        cfg = [provider(models=[{"id": "seed", "name": "S", "url": "https://x.test"}])]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cfg.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(serialize(cfg))
+
+            def failing(name, base_url, timeout=None, api_key=None):
+                return FetchResult(
+                    base_url=base_url,
+                    provider_name=name,
+                    success=False,
+                    error="HTTP 401",
+                )
+
+            stderr = io.StringIO()
+            with (
+                patch("clm_sync.cli.fetch_models", side_effect=failing),
+                patch("clm_sync.cli.fetch_credits", return_value=None),
+                patch.object(sys.stdout, "isatty", return_value=True),
+                patch("sys.stderr", stderr),
+            ):
+                code = cli.run(["--config", path, "--all"])
+            self.assertEqual(cli.EXIT_PARTIAL_FAILURE, code)
+            self.assertEqual("", stderr.getvalue())
+
+    def test_ci_run_reports_to_stderr_without_errors(self):
+        """A zero-failure run with non-TTY stdout (CI) must still mirror the
+        full report to stderr -- that is the whole reason the copy exists."""
+        cfg = [provider(models=[{"id": "seed", "name": "S", "url": "https://x.test"}])]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cfg.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(serialize(cfg))
+
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "clm_sync.cli.fetch_models",
+                    return_value=FetchResult(
+                        base_url="https://x.test",
+                        provider_name="TestProvider",
+                        success=True,
+                        model_ids=["seed"],
+                    ),
+                ),
+                patch("clm_sync.cli.fetch_credits", return_value=None),
+                patch.object(sys.stdout, "isatty", return_value=False),
+                patch("sys.stderr", stderr),
+            ):
+                code = cli.run(["--config", path, "--all"])
+            self.assertEqual(cli.EXIT_OK, code)
+            self.assertIn("[unchanged] TestProvider", stderr.getvalue())
+
+    def test_stderr_mirror_is_uncoloured(self):
+        """The stderr copy must never carry ANSI escape codes, even when the
+        run itself failed and stdout would have been coloured."""
+        cfg = [provider(models=[{"id": "seed", "name": "S", "url": "https://x.test"}])]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cfg.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(serialize(cfg))
+
+            def failing(name, base_url, timeout=None, api_key=None):
+                return FetchResult(
+                    base_url=base_url,
+                    provider_name=name,
+                    success=False,
+                    error="HTTP 401",
+                )
+
+            stderr = io.StringIO()
+            with (
+                patch("clm_sync.cli.fetch_models", side_effect=failing),
+                patch("clm_sync.cli.fetch_credits", return_value=None),
+                patch.object(sys.stdout, "isatty", return_value=False),
+                patch("sys.stderr", stderr),
+            ):
+                cli.run(["--config", path, "--all"])
+            self.assertNotIn("\x1b[", stderr.getvalue())
 
     def test_config_fixture_parses(self):
         data = [

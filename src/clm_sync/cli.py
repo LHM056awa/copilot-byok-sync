@@ -407,9 +407,18 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         f"{len(changed)} changed, {len(failed)} with errors."
     )
 
-    # Scripts/CI read stderr; keep the human report on stderr as well, but
-    # always uncoloured so it stays safe to grep / redirect.
-    if failed and plain_report:
+    # Scripts/CI read stderr.  Mirror the full report there only when stdout
+    # is *not* an interactive terminal -- i.e. the user cannot already see it
+    # on stdout -- and always uncoloured so it stays safe to grep / redirect.
+    # This is orthogonal to `failed`: a zero-failure CI run still gets the
+    # report, while an interactive TTY run is never duplicated.
+    try:
+        stdout_is_tty = sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        # No usable isatty() -> treat as non-interactive and mirror, which is
+        # the safe default for the scripted / CI consumers of stderr.
+        stdout_is_tty = False
+    if plain_report and not stdout_is_tty:
         print(plain_report, file=sys.stderr)
 
     return EXIT_PARTIAL_FAILURE if failed else EXIT_OK
