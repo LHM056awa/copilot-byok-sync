@@ -1,0 +1,12 @@
+{
+	"presets": [
+		{
+			"model_id_contains": ["deepseek"],
+			"overrides": {
+				"maxInputTokens": 1000000,
+				"maxOutputTokens": 384000,
+				"supportsReasoningEffort": ["none", "low", "high", "max"]
+			}
+		}
+	]
+}

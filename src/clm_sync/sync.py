@@ -31,6 +31,7 @@ from .models import (
     is_secret_placeholder,
     normalize_id,
 )
+from .presets import apply_presets
 
 PROTECTED_PROVIDER_FIELDS = ("name", "vendor", "apiKey", "apiType")
 
@@ -50,15 +51,6 @@ MODEL_CONFIG_FIELDS = (
 # existing entries are deep-copied untouched. Keep in sync with
 # MODEL_CONFIG_FIELDS when fields are added.
 _CANONICAL_MODEL_KEY_ORDER = ("id",) + MODEL_CONFIG_FIELDS
-
-DEFAULT_NEW_MODEL_FIELDS = {
-    "toolCalling": True,
-    "vision": True,
-    "maxInputTokens": 1000000,
-    "maxOutputTokens": 384000,
-    "supportsReasoningEffort": ["max"],
-}
-
 
 @dataclass
 class SyncOutcome:
@@ -282,16 +274,10 @@ def merge_provider_models(
             if model_id in surviving_ids:
                 continue
             remote_model = remote_metadata.get(model_id, {})
-            model = {
-                key: copy.deepcopy(remote_model[key])
-                for key in MODEL_CONFIG_FIELDS
-                if key in remote_model
-            }
+            model = apply_presets(model_id, remote_model, True)
             model["id"] = model_id
             model.setdefault("name", base_display_name(model_id))
             model.setdefault("url", base_url)
-            for key, value in DEFAULT_NEW_MODEL_FIELDS.items():
-                model.setdefault(key, copy.deepcopy(value))
             model = {k: model[k] for k in _CANONICAL_MODEL_KEY_ORDER if k in model}
             ordered.append(model)
             surviving_ids.add(model_id)

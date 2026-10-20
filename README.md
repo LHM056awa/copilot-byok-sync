@@ -4,6 +4,22 @@
 
 需要认证的端点会被自动解析 VS Code 加密存储（Secret Storage）里的 API key，并以 `Authorization: Bearer` 头发送。
 
+## 模型预设
+
+包内置的 `src/clm_sync/presets.json` 为特定模型提供非通用默认的配置。当前
+DeepSeek 预设匹配模型 id 中不区分大小写的 `deepseek` 子串，并设置 1,000,000
+输入 token、384,000 输出 token，以及 `none`、`low`、`high`、`max` 四档
+`supportsReasoningEffort`。
+
+预设文件格式为顶层 `presets` 数组，每项包含 `model_id_contains` 字符串数组和
+`overrides` 对象。允许覆盖 `toolCalling`、`vision`、`maxInputTokens`、
+`maxOutputTokens`、`supportsReasoningEffort`、`modelOptions`、`name`；`id`、`url`
+和未知字段不允许出现。多个预设命中时只使用第一个。
+
+新模型的字段优先级是：远端 `/v1/models` 返回值 > 预设 > 通用默认值。已经存在
+的本地模型不会重新应用预设。内置预设损坏或格式不合法时，工具会报告
+`ModelSyncError`，不会静默降级；本版本不提供用户覆盖预设文件。
+
 ## 安装与使用
 
 ### 1. 安装依赖

@@ -27,6 +27,7 @@ from clm_sync.config import load_config, serialize, write_config_atomic
 from clm_sync.models import ModelSyncError, base_display_name
 from clm_sync.sync import sync_config
 from clm_sync.models import FetchResult
+from clm_sync.presets import _load_presets, apply_presets
 
 
 def fake_transport(route: dict[str, object], api_key_sink: list[object] | None = None):
@@ -217,6 +218,150 @@ class DisplayNameTest(unittest.TestCase):
             base_display_name("something.with.dots/inner-segment"),
         )
         self.assertEqual("Foo.bar.baz", base_display_name("foo.bar.baz"))
+
+
+class PresetTest(unittest.TestCase):
+    def setUp(self):
+        _load_presets.cache_clear()
+
+    def tearDown(self):
+        _load_presets.cache_clear()
+
+    def test_new_model_hits_preset_and_fills_fields(self):
+        result = apply_presets("DeepSeek-V4", {}, True)
+        self.assertEqual(1000000, result["maxInputTokens"])
+        self.assertEqual(384000, result["maxOutputTokens"])
+        self.assertEqual(["none", "low", "high", "max"], result["supportsReasoningEffort"])
+
+    def test_new_model_remote_overrides_preset(self):
+        result = apply_presets(
+            "deepseek-v4",
+            {"maxOutputTokens": 123, "name": "Remote name"},
+            True,
+        )
+        self.assertEqual(123, result["maxOutputTokens"])
+        self.assertEqual("Remote name", result["name"])
+        self.assertEqual(["none", "low", "high", "max"], result["supportsReasoningEffort"])
+
+    def test_existing_model_is_not_touched(self):
+        metadata = {"name": "hand-authored", "custom": "value"}
+        self.assertEqual(metadata, apply_presets("deepseek-v4", metadata, False))
+
+    def test_non_matching_model_uses_defaults(self):
+        result = apply_presets("qwen3-8b", {}, True)
+        self.assertEqual(["max"], result["supportsReasoningEffort"])
+
+    def test_sync_new_deepseek_model_gets_preset(self):
+        cfg = [provider(models=[{"url": "https://x.test"}])]
+        route = {"https://x.test/v1/models": body("deepseek-chat")}
+        outcome = sync_config(cfg, lambda name, url: _fetch(name, url, route))
+        model = outcome.config[0]["models"][0]
+        self.assertEqual(1000000, model["maxInputTokens"])
+        self.assertEqual(384000, model["maxOutputTokens"])
+        self.assertEqual(
+            ["none", "low", "high", "max"], model["supportsReasoningEffort"]
+        )
+
+    def test_sync_existing_deepseek_model_not_touched(self):
+        existing = {
+            "id": "deepseek-chat",
+            "name": "DeepSeek Chat",
+            "url": "https://x.test",
+            "maxInputTokens": 1,
+        }
+        cfg = [provider(models=[existing])]
+        route = {"https://x.test/v1/models": body("deepseek-chat")}
+        outcome = sync_config(cfg, lambda name, url: _fetch(name, url, route))
+        model = outcome.config[0]["models"][0]
+        self.assertEqual(1, model["maxInputTokens"])
+
+    def test_sync_non_deepseek_model_uses_defaults(self):
+        cfg = [provider(models=[{"url": "https://x.test"}])]
+        route = {"https://x.test/v1/models": body("qwen3-8b")}
+        outcome = sync_config(cfg, lambda name, url: _fetch(name, url, route))
+        model = outcome.config[0]["models"][0]
+        self.assertEqual(1000000, model["maxInputTokens"])
+        self.assertEqual(["max"], model["supportsReasoningEffort"])
+
+    def test_first_matching_preset_wins(self):
+        with patch(
+            "clm_sync.presets.files",
+            return_value=_PresetResource(
+                json.dumps(
+                    {
+                        "presets": [
+                            {
+                                "model_id_contains": ["deepseek"],
+                                "overrides": {"name": "first"},
+                            },
+                            {
+                                "model_id_contains": ["deepseek"],
+                                "overrides": {"name": "second"},
+                            },
+                        ]
+                    }
+                )
+            ),
+        ):
+            self.assertEqual("first", apply_presets("deepseek-v4", {}, True)["name"])
+
+    def test_preset_rejects_forbidden_fields(self):
+        for field in ("url", "id"):
+            with self.subTest(field=field), patch(
+                "clm_sync.presets.files",
+                return_value=_PresetResource(
+                    json.dumps(
+                        {
+                            "presets": [
+                                {
+                                    "model_id_contains": ["x"],
+                                    "overrides": {field: "forbidden"},
+                                }
+                            ]
+                        }
+                    )
+                ),
+            ):
+                with self.assertRaises(ModelSyncError):
+                    apply_presets("x", {}, True)
+
+    def test_preset_rejects_unknown_fields(self):
+        with patch(
+            "clm_sync.presets.files",
+            return_value=_PresetResource(
+                json.dumps(
+                    {
+                        "presets": [
+                            {
+                                "model_id_contains": ["x"],
+                                "overrides": {"unknown": True},
+                            }
+                        ]
+                    }
+                )
+            ),
+        ):
+            with self.assertRaises(ModelSyncError):
+                apply_presets("x", {}, True)
+
+    def test_corrupt_preset_raises_error(self):
+        with patch(
+            "clm_sync.presets.files",
+            return_value=_PresetResource("{not json"),
+        ):
+            with self.assertRaises(ModelSyncError):
+                apply_presets("x", {}, True)
+
+
+class _PresetResource:
+    def __init__(self, text):
+        self.text = text
+
+    def joinpath(self, name):
+        return self
+
+    def read_text(self, encoding="utf-8"):
+        return self.text
 
 
 class NonTextFilterTest(unittest.TestCase):

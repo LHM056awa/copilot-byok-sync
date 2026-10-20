@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clm-sync"
-version = "0.6.0"
+version = "0.7.0"
 description = "Sync VS Code chatLanguageModels.json model lists from OpenAI-compatible endpoints"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,9 @@ clm-sync = "clm_sync.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+clm_sync = ["presets.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

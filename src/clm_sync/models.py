@@ -8,6 +8,14 @@ from typing import Any, Dict, List, Optional
 
 CUSTOM_ENDPOINT_VENDOR = "customendpoint"
 
+DEFAULT_NEW_MODEL_FIELDS = {
+    "toolCalling": True,
+    "vision": True,
+    "maxInputTokens": 1000000,
+    "maxOutputTokens": 384000,
+    "supportsReasoningEffort": ["max"],
+}
+
 
 @dataclass
 class FetchResult:

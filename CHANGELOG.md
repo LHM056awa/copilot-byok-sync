@@ -2,6 +2,18 @@
 
 All notable changes to `clm-sync` are documented in this file.
 
+## 0.7.0
+
+### Added
+
+- 新增随包内置的模型预设文件。DeepSeek 模型 id（大小写不敏感）命中
+  `deepseek` 子串时，新模型使用 1M 输入 token、384K 输出 token 和
+  `none`/`low`/`high`/`max` 四档 reasoning effort。
+- 预设按远端返回值 > 首个命中的预设 > 通用默认值应用；已有模型不会被重新修改。
+- 预设格式和字段进行严格校验，内置文件损坏时抛出 `ModelSyncError`，不静默降级。
+
+---
+
 ## 0.6.1 (2026-10-09)
 
 ### Fixed
