@@ -155,6 +155,50 @@ def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
 # The machine-readable copy sent to stderr is *always* uncoloured.
 # ---------------------------------------------------------------------------
 
+# "Grey" has to be spelled differently per terminal, because the two Windows
+# console hosts disagree about SGR 2 (faint):
+#
+#   * Windows Terminal, the VS Code integrated terminal (xterm.js) and Unix
+#     terminals *implement* faint and render it as a light grey, so SGR 2 is
+#     used there -- that spelling is what keeps this report byte-identical to
+#     the sibling tool dsh-byok-sync.
+#   * A legacy conhost (the window you get when double-clicking the .bat, i.e.
+#     cmd.exe's own console) *ignores* SGR 2.  Measured on this machine by
+#     writing the escape and reading the screen-buffer cell attributes back:
+#     faint leaves 0x00 (black on black, so ``[unchanged]`` disappears) and
+#     never a grey.  Bright black (SGR 90) *is* honoured there and lands on
+#     0x08, which reads as grey.  So conhost gets faint + bright black.
+_MUTED_FAINT = "\033[2m"
+_MUTED_CONHOST = "\033[2;90m"
+
+#: Environment markers of terminals known to implement SGR 2 (faint).  Absent
+#: all of them, the conservative conhost spelling is used: bright black renders
+#: grey everywhere, while a dropped faint would not render at all.
+_FAINT_MARKERS = (
+    "WT_SESSION",  # Windows Terminal
+    "TERM_PROGRAM",  # VS Code / iTerm / Apple Terminal / vscode-server
+    "COLORTERM",
+    "ANSICON",
+    "ConEmuANSI",
+    "TERM",  # xterm-compatible ptys
+)
+
+
+def _grey_code(environ=None) -> str:
+    """Return the escape that actually renders grey on *this* terminal.
+
+    Faint-capable terminals get the reference project's ``\\033[2m``; a legacy
+    conhost, which drops faint on the floor, gets ``\\033[2;90m`` (faint +
+    bright black) so ``[unchanged]`` / ``kept`` still read as grey instead of
+    vanishing into the body text.
+
+    *environ* is a test seam; production reads :data:`os.environ`.
+    """
+    env = os.environ if environ is None else environ
+    if any(env.get(marker) for marker in _FAINT_MARKERS):
+        return _MUTED_FAINT
+    return _MUTED_CONHOST
+
 
 def _windows_vt100_ready() -> bool:
     """Best-effort check that stdout's console can render ANSI (VT100) codes.
@@ -233,13 +277,18 @@ def _stdout_color_enabled() -> bool:
 
 
 class _C:
-    """ANSI colour codes (no-op placeholders when colour is disabled)."""
+    """ANSI colour codes (no-op placeholders when colour is disabled).
 
-    def __init__(self, enabled: bool) -> None:
+    ``dim`` -- the grey used for ``[unchanged]`` and the ``kept`` label -- is
+    resolved per run by :func:`_grey_code`, because conhost needs a different
+    spelling than Windows Terminal (see above).  *grey* is a test seam.
+    """
+
+    def __init__(self, enabled: bool, grey: Optional[str] = None) -> None:
         if enabled:
             self.reset = "\033[0m"
             self.bold = "\033[1m"
-            self.dim = "\033[2m"
+            self.dim = _grey_code() if grey is None else grey
             self.red = "\033[31m"
             self.green = "\033[32m"
             self.yellow = "\033[33m"

@@ -2,6 +2,14 @@
 
 All notable changes to `clm-sync` are documented in this file.
 
+## 0.7.1 (2026-11-19)
+
+### Fixed
+
+- **传统 cmd / conhost 窗口里的灰色不再失效**（`[unchanged]` 与 `kept` 此前显示成正文色、甚至看不见）：根因是灰色一律用 `\x1b[2m`（SGR 2 faint），而传统 conhost **不实现 faint**。实测（写入后读回屏幕缓冲区单元格属性）：conhost 上 faint 落到 `0x00`（黑底黑字，`[unchanged]` 直接消失），而亮黑 `\x1b[90m` 落到 `0x08`——才是灰色。现新增 `cli._grey_code()`：faint 可用的终端（存在 `WT_SESSION`、`TERM_PROGRAM`、`COLORTERM`、`ANSICON`、`ConEmuANSI`、`TERM` 任一标记，即 Windows Terminal / VS Code 集成终端 / xterm 类终端）继续用 `\x1b[2m`，与姊妹项目 `dsh-byok-sync` 逐字节一致；**没有任何标记时（cmd.exe 自己的窗口）改用 `\x1b[2;90m`**（faint + 亮黑）保证仍是灰色。两条分支都有测试（`GreyCodeTest`），并用真实 conhost 做了端到端验证（读回属性为 `0x08`，缓冲区无字面 ESC）。
+
+---
+
 ## 0.7.0
 
 ### Added

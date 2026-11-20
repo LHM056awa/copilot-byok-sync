@@ -2229,6 +2229,76 @@ class ColoringTest(unittest.TestCase):
         self.assertNotIn("\x1b[", cli.render_report(outcome, color=False))
 
 
+class GreyCodeTest(unittest.TestCase):
+    """Grey must be spelled per terminal: conhost drops SGR 2 (faint).
+
+    Measured on a real conhost by reading the screen-buffer attributes back:
+    ``\\x1b[2m`` leaves the cell at 0x00 (black on black -- ``[unchanged]``
+    vanishes) while ``\\x1b[2;90m`` renders bright black, 0x08, i.e. grey.
+    Windows Terminal / xterm.js do implement faint, so they keep the reference
+    project's byte-identical ``\\x1b[2m``.
+    """
+
+    def _render(self, env, **kwargs):
+        from clm_sync.models import ProviderSyncResult
+
+        result = ProviderSyncResult(name="P", **kwargs)
+        outcome = type("O", (), {"providers": [result]})()
+        with patch.dict(os.environ, env, clear=True):
+            return cli.render_report(outcome, color=True)
+
+    def test_faint_capable_terminals_get_the_reference_spelling(self):
+        for marker in ("WT_SESSION", "TERM_PROGRAM", "COLORTERM", "ANSICON",
+                       "ConEmuANSI", "TERM"):
+            with self.subTest(marker=marker):
+                self.assertEqual("\x1b[2m", cli._grey_code({marker: "1"}))
+
+    def test_legacy_conhost_gets_bright_black_instead(self):
+        # No terminal marker at all == cmd.exe's own console window.
+        self.assertEqual("\x1b[2;90m", cli._grey_code({}))
+
+    def test_unchanged_tag_is_grey_on_conhost(self):
+        # The reported bug: a bare faint is invisible in conhost, so the tag
+        # must carry bright black there.
+        report = self._render({}, changed=False)
+        self.assertIn("\x1b[2;90m[unchanged]\x1b[0m", report)
+        self.assertNotIn("\x1b[2m[unchanged]", report)
+
+    def test_kept_label_is_grey_on_conhost(self):
+        report = self._render({}, kept=163)
+        self.assertIn("\x1b[2;90m    kept    \x1b[0m(163)", report)
+
+    def test_windows_terminal_keeps_the_faint_spelling(self):
+        report = self._render({"WT_SESSION": "3c1b-..."}, kept=1)
+        self.assertIn("\x1b[2m[unchanged]\x1b[0m", report)
+        self.assertIn("\x1b[2m    kept    \x1b[0m(1)", report)
+        self.assertNotIn("\x1b[2;90m", report)
+
+    def test_grey_never_leaks_into_the_plain_copy(self):
+        from clm_sync.models import ProviderSyncResult
+
+        outcome = type(
+            "O", (), {"providers": [ProviderSyncResult(name="P", kept=3)]}
+        )()
+        with patch.dict(os.environ, {}, clear=True):
+            plain = cli.render_report(outcome, color=False)
+        self.assertNotIn("\x1b", plain)
+        self.assertIn("[unchanged] P", plain)
+        self.assertIn("    kept    (3) with existing metadata", plain)
+
+    def test_color_table_asks_the_terminal_which_grey_to_use(self):
+        # Regression guard: _C used to hard-code SGR 2, which conhost ignores,
+        # so the report was colourless-grey in cmd.exe no matter what.
+        with patch.object(cli, "_grey_code", return_value="\x1b[90m") as probe:
+            codes = cli._C(True)
+        probe.assert_called_once()
+        self.assertEqual("\x1b[90m", codes.dim)
+
+    def test_disabled_colour_table_has_no_dim_code(self):
+        self.assertEqual("", cli._C(False).dim)
+        self.assertEqual("", cli._C(False, grey="\x1b[2;90m").dim)
+
+
 class CliTest(unittest.TestCase):
     def test_package_main_entry_executes_cli(self):
         """Regression: `python -m clm_sync` must actually run the CLI."""

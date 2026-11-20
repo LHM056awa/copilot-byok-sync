@@ -183,6 +183,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 **着色启用条件：**
 
+- **灰色按终端自动选写法**：Windows Terminal / VS Code 集成终端 / 其他 xterm 类终端（存在 `WT_SESSION`、`TERM_PROGRAM`、`COLORTERM`、`ANSICON`、`ConEmuANSI`、`TERM` 任一标记）用 **`\x1b[2m`（faint）**，与姊妹项目 `dsh-byok-sync` **逐字节一致**；传统 conhost（**双击 `.bat` 打开的那个 cmd 窗口**）**不实现 faint**——实测写入 `\x1b[2m` 后单元格属性是 `0x00`（黑底黑字，`[unchanged]` 会"消失"），而亮黑 `\x1b[90m` 才渲染成 `0x08` 灰，因此那里改用 **`\x1b[2;90m`**（faint + 亮黑），保证 `[unchanged]` / `kept` 在 cmd 窗口里同样看得出是灰色。
 - 仅当标准输出（stdout）是**交互式 TTY**（终端直接显示）时输出 ANSI 颜色。
 - 当 stdout 被**重定向或管道**（如 `> log`、`| grep`）时自动输出纯文本，日志保持干净。
 - 设置环境变量 **`NO_COLOR`**（任意值，如 `NO_COLOR=1`）可全局强制关闭颜色。
