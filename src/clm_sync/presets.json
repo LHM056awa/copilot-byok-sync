@@ -7,6 +7,13 @@
 				"maxOutputTokens": 384000,
 				"supportsReasoningEffort": ["none", "low", "high", "max"]
 			}
+		},
+		{
+			"model_id_contains": ["agnes"],
+			"overrides": {
+				"maxInputTokens": 512000,
+				"maxOutputTokens": 65536
+			}
 		}
 	]
 }
