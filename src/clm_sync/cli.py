@@ -12,7 +12,7 @@ from . import __version__
 from .client import fetch_credits, fetch_models
 from .config import load_config, write_config_atomic
 from .models import ModelSyncError, endpoint_base_urls, is_custom_endpoint
-from .sync import sync_config
+from .sync import DEFAULT_MAX_WORKERS, sync_config
 
 try:
     from .secrets import resolve_placeholder
@@ -89,11 +89,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=15.0,
         help="per-request timeout in seconds (default: 15)",
     )
+    parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="number of concurrent endpoint requests (default: one per endpoint, "
+        f"capped at {DEFAULT_MAX_WORKERS}); --workers 1 restores fully serial "
+        "requests. Results are always merged in config order after every "
+        "request has finished, so output does not depend on N",
+    )
     parser.add_argument("--version", action="version", version=f"clm-sync {__version__}")
     return parser
 
 
-def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
+def _positive_int(value: str) -> int:
+    """argparse type for ``--workers``: a strictly positive integer."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
+def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all, workers=1):
     """Attach a display-only balance value to each synced provider.
 
     Balances come from each provider's *known* balance endpoint (matched by
@@ -108,9 +129,16 @@ def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
     mix up results and the pairing does not depend on list ordering.  When a
     specific subset is targeted, names are guaranteed unique by
     ``select_providers`` (a duplicate raises), so a name lookup is safe there.
+
+    *workers* bounds how many providers are looked up concurrently (``None``
+    = automatic, ``1`` = serial, the default for direct callers).  Keys are
+    resolved in the calling thread before any request is submitted, each
+    provider's own url fallback chain stays sequential (first non-empty value
+    wins, as before), and ``result.credits`` is only assigned in the calling
+    thread after every lookup has finished.
     """
     from .client import has_credits_endpoint
-    from .sync import resolve_provider_key
+    from .sync import resolve_provider_key, run_ordered
 
     if targets_all:
         def provider_for(result):
@@ -129,6 +157,10 @@ def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
         def provider_for(result):
             return by_name.get(result.name)
 
+    # Plan in the calling thread: pair results with providers, decide which
+    # ones have a known balance endpoint, and resolve their keys (possibly via
+    # DPAPI) before any worker starts.
+    planned = []
     for result in outcome.providers:
         prov = provider_for(result)
         if prov is None:
@@ -137,11 +169,27 @@ def enrich_with_credits(outcome, *, timeout, key_resolver, targets_all):
         if not any(has_credits_endpoint(u) for u in urls):
             continue  # no known balance endpoint -> omit balance line
         key = resolve_provider_key(prov, key_resolver)
-        value = None
-        for url in urls:
-            value = fetch_credits(result.name, url, timeout=timeout, api_key=key)
-            if value is not None:
-                break
+        planned.append((result, result.name, urls, key))
+
+    def lookup(name, urls, key):
+        # Runs in a worker: touches only its own arguments, never `outcome`.
+        try:
+            for url in urls:
+                value = fetch_credits(name, url, timeout=timeout, api_key=key)
+                if value is not None:
+                    return value
+        except Exception:  # display-only: a crash degrades to "unavailable"
+            return None
+        return None
+
+    values = run_ordered(
+        [
+            (lambda n=name, u=urls, k=key: lookup(n, u, k))
+            for _result, name, urls, key in planned
+        ],
+        workers,
+    )
+    for (result, _name, _urls, _key), value in zip(planned, values):
         result.credits = value if value is not None else "unavailable"
 
 
@@ -412,19 +460,23 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             allow_delete=not args.no_delete,
             key_resolver=resolve_placeholder,
             sort_models=args.sort,
+            max_workers=args.workers,
         )
     except ModelSyncError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
     # Auto-fetch balances unless --no-credits is given.  A failure here never
-    # affects model sync or the delete guard: the value is display-only.
+    # affects model sync or the delete guard: the value is display-only.  It
+    # runs as a separate phase, after every model request has been merged, and
+    # reuses the same --workers bound.
     if not args.no_credits:
         enrich_with_credits(
             outcome,
             timeout=args.timeout,
             key_resolver=resolve_placeholder,
             targets_all=args.providers is None,
+            workers=args.workers,
         )
 
     total = len(outcome.providers)
