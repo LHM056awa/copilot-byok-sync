@@ -57,8 +57,22 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 | `--no-delete` | 只添加远端发现的新模型，不删除或覆盖本地已有模型 |
 | `--sort` | 顺带把每个端点的模型列表按 id 字典序升序（大小写敏感）重排；默认保留原顺序 |
 | `--no-credits` | 跳过自动余额查询 |
-| `--timeout SECONDS` | 请求超时时间（秒），默认 15 |
+| `--timeout SECONDS` | **单个**请求的超时时间（秒），默认 15 |
+| `--workers N` | 并发端点请求数（正整数）。默认每个端点一个线程、最多 8 个；`--workers 1` 退回完全串行 |
 | `--version` | 显示版本信息 |
+
+### 并发请求
+
+所有 provider 的 `/v1/models` 请求会**多线程并发**发出，一轮同步的耗时从「各端点耗时之和」降到「最慢的那个请求」附近；某个端点卡到超时，也不会再拖着后面的端点排队等。
+
+并发只改变「怎么发请求、怎么收结果」，不改变结果本身：
+
+- **顺序确定**：结果按配置里的 provider / url 顺序汇总，与哪个请求先返回无关。新增模型的追加顺序、报告各行的内容与顺序，与 `--workers 1`（串行）**逐字节一致**。
+- **先收齐再合并，写盘只有一次**：所有请求结束后才做合并、删除判定和跨 provider `settings` 清理，最后一次性原子写盘；不会边请求边写，也不会按 provider 分批写。`--dry-run` 和无变更的运行照旧不写文件。
+- **删除保护不变**：只有某个 provider 的全部端点都返回结果、并且都成功后才会判断删除，不会因为「部分结果先回来」而提前删除。单个端点的任何失败（包括意外异常）都只记为该端点的 `error:`，其余端点照常同步。
+- **API key 在主线程解析**：占位符的 DPAPI 解密在发请求之前、主线程里完成（每个 provider 一次），工作线程只拿到解析好的 key。
+- **余额查询是独立的第二阶段**：模型同步全部完成后，再按同一个 `--workers` 并发查询余额；`--no-credits` 仍然完全跳过这一阶段。
+- `--timeout` 仍然是**每个请求**的超时。并发后一轮的总耗时上限大约是一个超时，而不是 N 个超时相加。
 
 ## URL 规范
 
@@ -211,7 +225,7 @@ python -m clm_sync.cli --config chatLanguageModels.json --provider A --provider 
 
 ```bash
 cd copilot-byok-sync
-python -m pytest tests/test_sync.py -v
+python -m pytest tests/ -v
 ```
 
 ### 项目结构
@@ -228,9 +242,10 @@ copilot-byok-sync/
 │   ├── config.py       # 读写 chatLanguageModels.json
 │   ├── models.py       # 数据结构
 │   ├── secrets.py      # VS Code 加密存储占位符解析（DPAPI + AES-GCM）
-│   └── sync.py         # 核心同步逻辑
+│   └── sync.py         # 核心同步逻辑（含保序并发请求）
 ├── tests/
-│   └── test_sync.py
+│   ├── test_sync.py
+│   └── test_concurrency.py  # 并发请求：确定性 / 加速 / 失败隔离 / 写盘时机
 ├── sync-global-models.bat   # 双击同步全局配置（cmd 窗口）
 ├── deploy_user_tasks.py    # 把工作区任务合并到用户级 tasks.json（label 级合并）
 ├── deploy-user-tasks.bat   # 上一条的双击入口
@@ -240,7 +255,8 @@ copilot-byok-sync/
 
 ### 后续计划
 
-- 将端点请求优化为多线程并发，减少多个端点依次等待造成的总耗时
 - 支持参数简写
 - 支持通过配置文件调整新增模型的预设
 - 优化 `name` 的大小写逻辑
+
+已完成：~~将端点请求优化为多线程并发~~（见上文「并发请求」与 `--workers` 参数）。
