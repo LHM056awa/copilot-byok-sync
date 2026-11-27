@@ -10,14 +10,18 @@ Guarantees implemented here:
   * deletion (models + their top-level `settings` entries) only happens when
     every endpoint contributing to that provider succeeded
   * no write occurs when nothing actually changed
+  * endpoint requests may run concurrently, but results are merged in
+    planned-call order and only after every request has finished, so the
+    outcome never depends on which request completed first
 """
 
 from __future__ import annotations
 
 import copy
 import inspect
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, TypeVar
 
 from .models import (
     CUSTOM_ENDPOINT_VENDOR,
@@ -51,6 +55,53 @@ MODEL_CONFIG_FIELDS = (
 # existing entries are deep-copied untouched. Keep in sync with
 # MODEL_CONFIG_FIELDS when fields are added.
 _CANONICAL_MODEL_KEY_ORDER = ("id",) + MODEL_CONFIG_FIELDS
+
+#: Upper bound for the automatic worker count (``max_workers=None``).  The
+#: work is pure network I/O, so a handful of threads already hides most of
+#: the latency without hammering anyone's gateway.
+DEFAULT_MAX_WORKERS = 8
+
+_T = TypeVar("_T")
+
+
+def resolve_worker_count(max_workers: Optional[int], task_count: int) -> int:
+    """Return the effective thread count for *task_count* independent requests.
+
+    ``None`` means automatic: ``max(1, min(DEFAULT_MAX_WORKERS, task_count))``.
+    An explicit value is clamped to ``[1, task_count]`` so no idle threads are
+    spawned; ``1`` always means the plain in-thread serial path.
+    """
+    if max_workers is None:
+        return max(1, min(DEFAULT_MAX_WORKERS, task_count))
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be a positive integer, got {max_workers!r}")
+    return max(1, min(max_workers, task_count))
+
+
+def run_ordered(tasks: Sequence[Callable[[], _T]], max_workers: Optional[int]) -> List[_T]:
+    """Run zero-argument *tasks* and return their results in *submission* order.
+
+    This is the only place where concurrency lives.  Completion order never
+    leaks out: results are collected future-by-future in the order the tasks
+    were given, so downstream merging/reporting sees exactly the sequence the
+    serial loop would have produced.  With one effective worker the tasks run
+    inline in the calling thread (no executor at all), which is the
+    byte-for-byte fallback to the historical serial behaviour.
+
+    Tasks are expected to convert their own failures into values; an
+    exception that still escapes is re-raised here after the pool has been
+    shut down (pending tasks are cancelled).
+    """
+    workers = resolve_worker_count(max_workers, len(tasks))
+    if workers <= 1:
+        return [task() for task in tasks]
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="clm-sync")
+    try:
+        futures = [executor.submit(task) for task in tasks]
+        return [future.result() for future in futures]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
 
 @dataclass
 class SyncOutcome:
@@ -528,6 +579,26 @@ def _fetcher_takes_key(fetcher) -> bool:
     return len(positional) >= 3
 
 
+def _isolated_fetch(fetcher, name: str, base_url: str, args: tuple) -> FetchResult:
+    """Call *fetcher* and turn any escaping exception into a failed result.
+
+    Runs inside a worker thread.  The production fetcher (``fetch_models``)
+    already converts every failure into ``FetchResult(success=False)``; this
+    guard extends the same "one endpoint never aborts the run" contract to
+    injected fetchers, so every planned call yields exactly one result and
+    the delete guard sees the failure instead of the whole sync blowing up.
+    """
+    try:
+        return fetcher(*args)
+    except Exception as exc:  # defensive: never let one endpoint abort the run
+        return FetchResult(
+            base_url=base_url,
+            provider_name=name,
+            success=False,
+            error=f"unexpected error: {str(exc) or type(exc).__name__}",
+        )
+
+
 def sync_config(
     config: List[Dict[str, Any]],
     fetcher,
@@ -536,6 +607,7 @@ def sync_config(
     allow_delete: bool = True,
     key_resolver=None,
     sort_models: bool = False,
+    max_workers: Optional[int] = 1,
 ) -> SyncOutcome:
     """Run the full sync pipeline over `config` without touching disk.
 
@@ -548,6 +620,15 @@ def sync_config(
     store.  *sort_models* (default False) rewrites each provider's model list
     in ascending model-id order; when False the original order is preserved and
     new models are appended.
+
+    *max_workers* bounds how many endpoint requests run concurrently.  The
+    library default ``1`` keeps the historical serial behaviour for callers
+    whose fetcher may not be thread-safe; ``None`` picks
+    ``min(DEFAULT_MAX_WORKERS, number of requests)`` (what the CLI does).
+    Concurrency only changes *how* results are collected: they are always
+    handed to the merge step in planned-call order and only after every
+    request has finished, so merging, the delete guard, the report and the
+    returned config are identical for any worker count.
     """
     working = copy.deepcopy(config)
     positions = _select_positions(config, provider_names)
@@ -556,20 +637,32 @@ def sync_config(
     calls = plan_calls(providers)
     pass_key = _fetcher_takes_key(fetcher)
 
-    # Results are keyed by the provider object itself so providers that share
-    # a name can never mix up their fetch results.
-    results_by_provider: Dict[int, List[FetchResult]] = {}
+    # Resolve API keys up front, in the calling thread, once per provider:
+    # the secret resolver may go through ctypes/DPAPI/cryptography, which is
+    # kept out of the worker threads entirely.  Workers only ever receive
+    # plain (name, base_url, key) values -- never the mutable provider dict.
+    keys_by_provider: Dict[int, Optional[str]] = {}
+    tasks: List[Callable[[], FetchResult]] = []
     for provider, base_url in calls:
         name = provider.get("name") or "<unnamed>"
         if pass_key:
-            api_key = resolve_provider_key(provider, key_resolver)
-            results_by_provider.setdefault(id(provider), []).append(
-                fetcher(name, base_url, api_key)
-            )
+            if id(provider) not in keys_by_provider:
+                keys_by_provider[id(provider)] = resolve_provider_key(provider, key_resolver)
+            args: tuple = (name, base_url, keys_by_provider[id(provider)])
         else:
-            results_by_provider.setdefault(id(provider), []).append(
-                fetcher(name, base_url)
-            )
+            args = (name, base_url)
+        tasks.append(
+            lambda n=name, u=base_url, a=args: _isolated_fetch(fetcher, n, u, a)
+        )
+
+    fetched = run_ordered(tasks, max_workers)
+
+    # Results are keyed by the provider object itself so providers that share
+    # a name can never mix up their fetch results.  `fetched` is in planned
+    # call order regardless of which request finished first.
+    results_by_provider: Dict[int, List[FetchResult]] = {}
+    for (provider, _base_url), result in zip(calls, fetched):
+        results_by_provider.setdefault(id(provider), []).append(result)
 
     provider_results: List[ProviderSyncResult] = []
     for provider, config_index in zip(providers, positions):

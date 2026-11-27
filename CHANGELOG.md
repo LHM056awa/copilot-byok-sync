@@ -2,6 +2,19 @@
 
 All notable changes to `clm-sync` are documented in this file.
 
+## 0.8.0 (2026-11-27)
+
+### Added
+
+- **端点请求改为多线程并发**：`/v1/models` 请求和余额查询都改用 `ThreadPoolExecutor` 并发发出，一轮耗时从「各端点耗时之和」降到「最慢的单个请求」附近，某个端点卡到 `--timeout` 也不会再拖住其他端点。新增 `--workers N` 参数（并发端点请求数，默认 `min(8, 端点数)`；`--workers 1` 退回串行）。
+  - **输出与串行版逐字节一致**：结果按配置顺序回填（不是按完成顺序），并且等全部请求结束后才合并、判定删除、清理跨 provider `settings`，最后只原子写盘一次。合并、删除判定、报告和写盘逻辑都没有改动。已用同一份配置和 mock 数据对照 0.7.1，`--all` / `--no-delete` / `--sort` / `--dry-run` / `--no-credits` / `--provider` 各模式下，stdout、stderr、退出码和写出的文件都相同。
+  - **线程安全**：API key（含 DPAPI 占位符解析）在主线程、提交请求前解析，每个 provider 只解析一次；工作线程只拿到 `(name, url, key)` 这些不可变的值。注入的 fetcher 抛出的任何异常都会转成该端点的 `FetchResult(success=False)`（报告里显示为 `error: ... unexpected error: ...`），会阻止该 provider 的删除，但不影响其他端点。余额查询同样隔离：异常一律显示为 `unavailable`。
+  - 余额查询仍是独立的第二阶段，在模型同步完成后才运行，`--no-credits` 仍然完全跳过。同一 provider 多个 url 之间「取第一个可用值」的回退链保持串行。
+  - 库 API：`sync_config(..., max_workers=1)` 和 `enrich_with_credits(..., workers=1)` 默认仍是串行，保护可能不是线程安全的注入式 fetcher；传 `None` 表示自动选择线程数，CLI 默认就用这个。
+  - 新增 `tests/test_concurrency.py`（29 个用例，全部离线），覆盖：不同 worker 数下结果一致、实际加速、失败隔离、写盘时机、legacy 两参 fetcher、key 解析时机与线程、余额阶段并发、`--workers` 参数校验。
+
+---
+
 ## 0.7.1 (2026-11-19)
 
 ### Fixed
